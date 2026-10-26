@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -367,7 +368,7 @@ class VoiceCloneTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, patch.object(
             bot, "synthesize_elevenlabs_tts", side_effect=fake_elevenlabs
         ), patch.object(bot, "synthesize_gemini_tts", side_effect=fail_gemini), patch.object(
-            bot, "TTS_PROVIDER", "auto"
+            bot, "TTS_PROVIDER", "gemini"
         ):
             path, provider, resolved = asyncio.run(
                 bot.synthesize_narration(
@@ -456,7 +457,9 @@ class EncodingAndSplittingTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory, patch.object(
             bot, "run_ffmpeg_with_progress", side_effect=fake_run_ffmpeg
-        ), patch.object(bot, "get_media_duration", return_value=100.0):
+        ), patch.object(bot, "get_media_duration", return_value=100.0), patch.object(
+            bot, "PIPELINE_WORKERS", 1
+        ):
             source = os.path.join(directory, "source.mp4")
             audio = os.path.join(directory, "audio.mp3")
             output = os.path.join(directory, "final.mp4")
@@ -926,6 +929,7 @@ class BotInterfaceTests(unittest.TestCase):
         self.assertNotIn("/dyy", bot.help_message())
         self.assertNotIn("dyy", callbacks)
         self.assertIn("Always On · Live", bot.status_message(123))
+        self.assertIn(f"{bot.PIPELINE_WORKERS} worker(s)", bot.status_message(123))
         self.assertFalse(hasattr(bot, "dyy_preferences"))
         self.assertFalse(hasattr(bot, "DYY_AGENT_ENABLED"))
 
@@ -1132,6 +1136,450 @@ class VoicePreviewTests(unittest.TestCase):
         self.assertEqual(len(uploads), 1)
         self.assertIn("Selected voice clone", uploads[0][0]["caption"])
         self.assertEqual(uploads[0][1]["audio"][2], "audio/mpeg")
+
+
+class ParallelPipelinePlanningTests(unittest.TestCase):
+    def test_ranges_are_ordered_bounded_and_gapless(self):
+        ranges = bot.divide_timeline_ranges(100.0, 99)
+        self.assertEqual(len(ranges), 4)
+        self.assertEqual(ranges[0]["start"], 0.0)
+        self.assertEqual(ranges[-1]["end"], 100.0)
+        for previous, current in zip(ranges, ranges[1:]):
+            self.assertEqual(previous["end"], current["start"])
+            self.assertGreater(current["end"], current["start"])
+
+    def test_sparse_narration_is_fitted_to_eighty_percent(self):
+        segments = [
+            {"start": 0.0, "end": 10.0, "gender": "male", "burmese": "ပထမ"},
+            {"start": 50.0, "end": 60.0, "gender": "male", "burmese": "ဒုတိယ"},
+        ]
+        fitted = bot.fit_recap_narration_windows(segments, 100.0)
+        self.assertAlmostEqual(bot.narration_window_coverage(fitted, 100.0), 0.8)
+        self.assertGreaterEqual(fitted[1]["start"], fitted[0]["end"])
+        self.assertLessEqual(fitted[-1]["end"], 100.0)
+
+    def test_worker_prompt_retains_first_person_map_and_range(self):
+        prompt = bot.build_script_worker_prompt(
+            100.0,
+            "ဇာတ်လမ်းအပြည့်အစုံ shared-map-marker",
+            {"index": 2, "start": 50.0, "end": 75.0},
+            4,
+        )
+        self.assertIn("FIRST-PERSON point of view", prompt)
+        self.assertIn("shared-map-marker", prompt)
+        self.assertIn("worker 3 of 4", prompt)
+        self.assertIn("50.000 to 75.000 seconds", prompt)
+        self.assertIn("20.0 seconds", prompt)
+
+    def test_worker_segments_are_clamped_and_ordered(self):
+        segments = [
+            {"start": 24.0, "end": 30.0, "burmese": "နောက်မှ"},
+            {"start": 20.0, "end": 22.0, "burmese": "အရင်"},
+            {"start": 0.0, "end": 1.0, "burmese": "နရာအပြင်"},
+        ]
+        normalized = bot.normalize_worker_segments(segments, 20.0, 25.0)
+        self.assertEqual([item["burmese"] for item in normalized], ["အရင်", "နောက်မှ"])
+        self.assertEqual(normalized[0]["start"], 20.0)
+        self.assertEqual(normalized[1]["start"], 24.0)
+        self.assertEqual(normalized[1]["end"], 25.0)
+
+
+class ParallelScriptTests(unittest.TestCase):
+    @staticmethod
+    def range_from_prompt(prompt):
+        match = re.search(
+            r"exclusive source range is\s+([0-9.]+) to ([0-9.]+) seconds",
+            prompt,
+        )
+        return float(match.group(1)), float(match.group(2))
+
+    def test_four_script_workers_share_audio_map_and_merge_in_order(self):
+        prepare_calls = []
+        prompts = []
+        shared_audio = []
+        active = [0, 0]
+        deleted = []
+        progress = []
+        fake_client = SimpleNamespace(
+            files=SimpleNamespace(delete=lambda name: deleted.append(name))
+        )
+
+        async def fake_prepare(client, audio_path):
+            prepare_calls.append(audio_path)
+            return "shared-audio-part", "uploaded-audio"
+
+        async def fake_generate(*args, **kwargs):
+            self.assertFalse(kwargs["require_segments"])
+            return "complete shared story map"
+
+        async def fake_worker(*args, **kwargs):
+            active[0] += 1
+            active[1] = max(active[1], active[0])
+            prompt = kwargs["prompt_override"]
+            prompts.append(prompt)
+            shared_audio.append(kwargs["_shared_audio_part"])
+            start, end = self.range_from_prompt(prompt)
+            await asyncio.sleep(0)
+            active[0] -= 1
+            return [
+                {
+                    "start": start,
+                    "end": start + (end - start) * 0.8,
+                    "gender": "male",
+                    "burmese": f"ကျွန်တော် {start:.0f}",
+                }
+            ]
+
+        async def report(text):
+            progress.append(text)
+
+        with patch.object(bot.genai, "Client", return_value=fake_client), patch.object(
+            bot, "prepare_gemini_audio", side_effect=fake_prepare
+        ), patch.object(bot, "generate_recap_response", side_effect=fake_generate), patch.object(
+            bot, "create_recap_script_gemini", side_effect=fake_worker
+        ):
+            segments = asyncio.run(
+                bot.create_recap_script_parallel(
+                    "speech.mp3",
+                    100.0,
+                    np.zeros(8000, dtype=np.int16),
+                    4,
+                    progress_callback=report,
+                )
+            )
+
+        self.assertEqual(prepare_calls, ["speech.mp3"])
+        self.assertEqual(len(prompts), 4)
+        self.assertEqual(active[1], 4)
+        self.assertEqual(shared_audio, ["shared-audio-part"] * 4)
+        self.assertTrue(all("complete shared story map" in prompt for prompt in prompts))
+        self.assertEqual([item["start"] for item in segments], sorted(item["start"] for item in segments))
+        self.assertAlmostEqual(bot.narration_window_coverage(segments, 100.0), 0.8)
+        self.assertEqual(deleted, ["uploaded-audio"])
+        self.assertTrue(any("Script locked" in text for text in progress))
+
+    def test_incomplete_script_worker_retries_then_uses_full_story_fallback(self):
+        attempts = [0, 0, 0, 0]
+        fallback_calls = []
+        progress = []
+        fake_client = SimpleNamespace(files=SimpleNamespace(delete=lambda name: None))
+
+        async def fake_prepare(client, audio_path):
+            return "shared-audio", None
+
+        async def fake_generate(*args, **kwargs):
+            return "shared map"
+
+        async def fake_worker(*args, **kwargs):
+            if not kwargs.get("_worker_mode"):
+                fallback_calls.append(kwargs)
+                return [{"start": 0.0, "end": 80.0, "gender": "male", "burmese": "အပြည့်အစုံ"}]
+            start, end = self.range_from_prompt(kwargs["prompt_override"])
+            index = int(start // 25)
+            attempts[index] += 1
+            if index == 1:
+                raise RuntimeError("incomplete worker range")
+            return [{"start": start, "end": end - 1, "gender": "male", "burmese": "အပိုင်း"}]
+
+        async def report(text):
+            progress.append(text)
+
+        with patch.object(bot.genai, "Client", return_value=fake_client), patch.object(
+            bot, "prepare_gemini_audio", side_effect=fake_prepare
+        ), patch.object(bot, "generate_recap_response", side_effect=fake_generate), patch.object(
+            bot, "create_recap_script_gemini", side_effect=fake_worker
+        ):
+            segments = asyncio.run(
+                bot.create_recap_script_parallel(
+                    "speech.mp3",
+                    100.0,
+                    np.zeros(8000, dtype=np.int16),
+                    4,
+                    progress_callback=report,
+                )
+            )
+
+        self.assertEqual(attempts[1], 2)
+        self.assertEqual(len(fallback_calls), 1)
+        self.assertEqual(fallback_calls[0]["worker_count"], 1)
+        self.assertEqual(fallback_calls[0]["_shared_audio_part"], "shared-audio")
+        self.assertEqual(segments[0]["burmese"], "အပြည့်အစုံ")
+        self.assertTrue(any("full-story fallback" in text for text in progress))
+
+    def test_script_worker_setting_four_routes_to_parallel_pipeline(self):
+        calls = []
+
+        async def fake_parallel(*args, **kwargs):
+            calls.append((args, kwargs))
+            return [{"start": 0.0, "end": 8.0, "burmese": "ကျွန်တော်"}]
+
+        with patch.object(bot, "PIPELINE_WORKERS", 4), patch.object(
+            bot, "create_recap_script_parallel", side_effect=fake_parallel
+        ):
+            segments = asyncio.run(
+                bot.create_recap_script_gemini(
+                    "speech.mp3",
+                    10.0,
+                    np.zeros(8000, dtype=np.int16),
+                )
+            )
+        self.assertEqual(segments[0]["burmese"], "ကျွန်တော်")
+        self.assertEqual(calls[0][0][3], 4)
+
+    def test_script_worker_setting_one_keeps_one_pass_path(self):
+        fake_client = SimpleNamespace(files=SimpleNamespace(delete=lambda name: None))
+
+        async def fake_prepare(client, audio_path):
+            return "audio-part", None
+
+        async def fake_generate(*args, **kwargs):
+            return '[{"start":0,"end":8,"gender":"male","burmese":"ကျွန်တော် ဆက်သွားတယ်"}]'
+
+        async def unexpected_parallel(*args, **kwargs):
+            raise AssertionError("parallel script path must stay off")
+
+        with patch.object(bot.genai, "Client", return_value=fake_client), patch.object(
+            bot, "prepare_gemini_audio", side_effect=fake_prepare
+        ), patch.object(bot, "generate_recap_response", side_effect=fake_generate), patch.object(
+            bot, "create_recap_script_parallel", side_effect=unexpected_parallel
+        ), patch.object(bot, "PIPELINE_WORKERS", 1), patch.object(bot, "DEEPSEEK_API_KEY", ""):
+            segments = asyncio.run(
+                bot.create_recap_script_gemini(
+                    "speech.mp3",
+                    10.0,
+                    np.zeros(8000, dtype=np.int16),
+                )
+            )
+        self.assertEqual(len(segments), 1)
+        self.assertEqual(segments[0]["end"], 8.0)
+
+
+class ParallelVoiceoverTests(unittest.TestCase):
+    def test_voice_workers_share_locked_voice_and_mix_in_script_order(self):
+        active = [0, 0]
+        preferred_providers = []
+        voice_ids = []
+        mix_order = []
+        progress = []
+
+        async def fake_prepare(segment, index, work_dir, preferred_provider, voice_id):
+            active[0] += 1
+            active[1] = max(active[1], active[0])
+            preferred_providers.append(preferred_provider)
+            voice_ids.append(voice_id)
+            await asyncio.sleep(0)
+            trimmed = os.path.join(work_dir, f"seg_{index}_trim.wav")
+            with open(trimmed, "wb") as trimmed_file:
+                trimmed_file.write(b"trimmed" * 100)
+            active[0] -= 1
+            return {
+                "index": index,
+                "trimmed_wav": trimmed,
+                "duration": 0.1,
+                "provider": "elevenlabs",
+                "voice_id": "Voice-01",
+            }
+
+        def fake_run_cmd(cmd, timeout):
+            output = cmd[-1]
+            if output.endswith(".pcm"):
+                mix_order.append(int(re.search(r"seg_(\d+)\.pcm", output).group(1)))
+                np.full(240, 1000, dtype=np.int16).tofile(output)
+            else:
+                with open(output, "wb") as output_file:
+                    output_file.write(b"audio" * 100)
+            return SimpleNamespace(returncode=0, stderr=b"")
+
+        async def report(processed, total, successful):
+            progress.append((processed, total, successful))
+
+        segments = [
+            {"start": index * 2.0, "end": index * 2.0 + 1.6, "burmese": str(index)}
+            for index in range(9)
+        ]
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            bot, "prepare_narration_segment", side_effect=fake_prepare
+        ), patch.object(bot, "run_cmd", side_effect=fake_run_cmd):
+            output = os.path.join(directory, "dub.mp3")
+            provider = asyncio.run(
+                bot.synthesize_dubbed_track_parallel(
+                    segments,
+                    18.0,
+                    directory,
+                    output,
+                    progress_callback=report,
+                    worker_count=4,
+                )
+            )
+            remaining = os.listdir(directory)
+
+        self.assertEqual(provider, "elevenlabs")
+        self.assertEqual(active[1], 4)
+        self.assertIsNone(preferred_providers[0])
+        self.assertEqual(preferred_providers[1:], ["elevenlabs"] * 8)
+        self.assertEqual(voice_ids[1:], ["Voice-01"] * 8)
+        self.assertEqual(mix_order, list(range(9)))
+        self.assertEqual(progress[-1], (9, 9, 9))
+        self.assertFalse(any(name.startswith("seg_") for name in remaining))
+
+    def test_voiceover_worker_setting_four_routes_to_parallel_pipeline(self):
+        calls = []
+
+        async def fake_parallel(*args, **kwargs):
+            calls.append((args, kwargs))
+            return "elevenlabs"
+
+        async def unexpected_sequential(*args, **kwargs):
+            raise AssertionError("sequential voiceover must stay off")
+
+        with patch.object(bot, "PIPELINE_WORKERS", 4), patch.object(
+            bot, "synthesize_dubbed_track_parallel", side_effect=fake_parallel
+        ), patch.object(bot, "synthesize_dubbed_track_sequential", side_effect=unexpected_sequential):
+            provider = asyncio.run(bot.synthesize_dubbed_track([], 1.0, "work", "out.mp3"))
+        self.assertEqual(provider, "elevenlabs")
+        self.assertEqual(calls[0][1]["worker_count"], 4)
+
+    def test_voiceover_worker_setting_one_uses_sequential_fallback(self):
+        calls = []
+
+        async def fake_sequential(*args):
+            calls.append(args)
+            return "edge"
+
+        async def unexpected_parallel(*args, **kwargs):
+            raise AssertionError("parallel voiceover must stay off")
+
+        with patch.object(bot, "PIPELINE_WORKERS", 1), patch.object(
+            bot, "synthesize_dubbed_track_sequential", side_effect=fake_sequential
+        ), patch.object(bot, "synthesize_dubbed_track_parallel", side_effect=unexpected_parallel):
+            provider = asyncio.run(bot.synthesize_dubbed_track([], 1.0, "work", "out.mp3"))
+        self.assertEqual(provider, "edge")
+        self.assertEqual(len(calls), 1)
+
+
+class ParallelRenderingTests(unittest.TestCase):
+    def test_four_render_parts_use_common_settings_and_ordered_validated_join(self):
+        calls = []
+        active = [0, 0]
+        progress = []
+        concat_order = []
+
+        async def fake_run_ffmpeg(cmd, timeout, progress_callback=None):
+            active[0] += 1
+            active[1] = max(active[1], active[0])
+            calls.append(cmd)
+            await asyncio.sleep(0)
+            output = cmd[-1]
+            is_join = "-f" in cmd and cmd[cmd.index("-f") + 1] == "concat"
+            if is_join:
+                concat_path = cmd[cmd.index("-i") + 1]
+                with open(concat_path, "r", encoding="utf-8") as concat_file:
+                    concat_order.extend(concat_file.readlines())
+                size = 950_000
+                encoded_seconds = 100.0
+            else:
+                size = 200_000
+                encoded_seconds = float(cmd[cmd.index("-t") + 1])
+            with open(output, "wb") as output_file:
+                output_file.truncate(size)
+            if progress_callback:
+                await progress_callback(
+                    {
+                        "out_time_ms": str(int(encoded_seconds * 1_000_000)),
+                        "total_size": str(size),
+                        "speed": "1.0x",
+                    }
+                )
+            active[0] -= 1
+            return SimpleNamespace(returncode=0, stderr=b"")
+
+        def fake_duration(path):
+            return 25.0 if ".part" in os.path.basename(path) else 100.0
+
+        async def report(stats, encode_pass):
+            progress.append((stats, encode_pass))
+
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            bot, "run_ffmpeg_with_progress", side_effect=fake_run_ffmpeg
+        ), patch.object(bot, "get_media_duration", side_effect=fake_duration), patch.object(
+            bot, "get_media_stream_types", return_value={"video", "audio"}
+        ), patch.object(bot, "RENDER_THREADS_PER_WORKER", 2):
+            source = os.path.join(directory, "source.mp4")
+            audio = os.path.join(directory, "audio.mp3")
+            output = os.path.join(directory, "final.mp4")
+            open(source, "wb").close()
+            open(audio, "wb").close()
+            final_size = asyncio.run(
+                bot.encode_video_to_target_size_parallel(
+                    source,
+                    output,
+                    1_000_000,
+                    100.0,
+                    audio,
+                    progress_callback=report,
+                    worker_count=4,
+                )
+            )
+            part_commands = [cmd for cmd in calls if ".part" in cmd[-1]]
+            output_size = os.path.getsize(output)
+            parts_remain = [cmd[-1] for cmd in part_commands if os.path.exists(cmd[-1])]
+
+        self.assertEqual(final_size, 950_000)
+        self.assertEqual(output_size, 950_000)
+        self.assertEqual(len(part_commands), 4)
+        self.assertEqual(active[1], 4)
+        self.assertEqual(
+            [float(cmd[cmd.index("-ss") + 1]) for cmd in part_commands],
+            [0.0, 25.0, 50.0, 75.0],
+        )
+        for option in ("-b:v", "-b:a", "-vf", "-threads", "-c:v"):
+            values = [cmd[cmd.index(option) + 1] for cmd in part_commands]
+            self.assertEqual(len(set(values)), 1, option)
+        for cmd in part_commands:
+            seek_indexes = [index for index, value in enumerate(cmd) if value == "-ss"]
+            self.assertEqual(len(seek_indexes), 2)
+            self.assertEqual(cmd[seek_indexes[0] + 1], cmd[seek_indexes[1] + 1])
+        self.assertEqual(
+            [int(re.search(r"\.part(\d+)\.", line).group(1)) for line in concat_order],
+            [0, 1, 2, 3],
+        )
+        self.assertTrue(any(stats.get("joining") for stats, _ in progress))
+        self.assertTrue(any(stats.get("validated") for stats, _ in progress))
+        self.assertEqual(parts_remain, [])
+
+    def test_render_wrapper_reports_and_uses_sequential_fallback(self):
+        sequential_calls = []
+        parallel_calls = []
+        progress = []
+
+        async def failed_parallel(*args, **kwargs):
+            parallel_calls.append((args, kwargs))
+            raise RuntimeError("parallel test failure")
+
+        async def fake_sequential(*args):
+            sequential_calls.append(args)
+            return 123_000
+
+        async def report(stats, encode_pass):
+            progress.append(stats)
+
+        with patch.object(bot, "PIPELINE_WORKERS", 4), patch.object(
+            bot, "encode_video_to_target_size_parallel", side_effect=failed_parallel
+        ), patch.object(bot, "encode_video_to_target_size_sequential", side_effect=fake_sequential):
+            result = asyncio.run(
+                bot.encode_video_to_target_size(
+                    "source.mp4",
+                    "final.mp4",
+                    1_000_000,
+                    100.0,
+                    "audio.mp3",
+                    progress_callback=report,
+                )
+            )
+        self.assertEqual(result, 123_000)
+        self.assertEqual(parallel_calls[0][1]["worker_count"], 4)
+        self.assertEqual(len(sequential_calls), 1)
+        self.assertTrue(any(stats.get("sequential_fallback") for stats in progress))
 
 
 class HandlerFlowTests(unittest.TestCase):

@@ -29,13 +29,24 @@ Rednote (小红书) video link ကို Telegram bot ဆီ ပို့လိ�
 - Narration၊ နောက်ကြောင်း၊ စိတ်ထဲအသံနဲ့ အဓိကစကားတွေအကုန် first-person voice အတည်းထားပြီး third-person narrator ကို မပြောင်းပါဘူး။
 - Script narration window စုစုပေါင်းကို မူရင်း duration ရဲ့ **၈၀% ခန့်** ထိန်းပြီး၊ ပထမ ၈၀% ကိုပဲ ဖြတ်တာမဟုတ်ဘဲ ဇာတ်လမ်းအစ/အဆုံး အပြည့်အစုံကို အကျဉ်းချုပ်ပါတယ်။ ကျန် ၂၀% ကို pause/transition အဖြစ် ထားပါတယ်။
 - Script generation မှာ Gemini primary model က စတင်ပြီး response က **20s ထက် ကြာ**သို့မဟုတ် fail ဖြစ်မှ backup helpers ကို တစ်ခုချင်း ထပ်စတင်ပါတယ်။ အများဆုံး **၃ model** က **မူရင်း prompt အတိအကျတစ်ခုထဲ** ကိုသုံးပြီး အရင်ရတဲ့ valid JSON draft ကို ယူ၊ ကျန် request တွေကို cancel လုပ်ပါတယ်။ Primary အမြန်ပြီးရင် helper လုံးဝမခေါ်ပါဘူး။
-- ဒါက API key ၃ ခု အသစ်လိုတာမဟုတ်ဘဲ Gemini API key တစ်ခုထဲက model-level helpers ဖြစ်ပါတယ်။ Slow/failed job မှာ added requests ပါသွားနိုင်တဲ့အတွက် provider quota/cost သက်ရှိနိုင်ပြီး `GEMINI_SCRIPT_MAX_PARALLEL=1` နဲ့ helpers ကို ပိတ်နိုင်ပါတယ်။
+- ဒါက API key ၃ ခု အသစ်လိုတာမဟုတ်ဘဲ Gemini API key တစ်ခုထဲက model-level helpers ဖြစ်ပါတယ်။ Slow/failed job မှာ added requests ပါသွားနိုင်တဲ့အတွက် provider quota/cost သက်ရှိနိုင်ပြီး `GEMINI_SCRIPT_MAX_PARALLEL=1` နဲ့ တစ်ခုချင်း worker အတွင်း slow-response helpers ကို ပိတ်နိုင်ပါတယ်။ Pipeline တစ်ခုလုံးကို sequential လုပ်ချင်ရင်တော့ `PIPELINE_WORKERS=1` ကို သုံးပါ။
 - စာပေသံစဉ်မဟုတ်ဘဲ သဘာဝကျတဲ့ မြန်မာအပြောစကား သုံးပါတယ်။ `DEEPSEEK_API_KEY` ရှိရင် DeepSeek က script ကို timing မပြောင်းဘဲ ထပ်ဆန်းပေးနိုင်ပြီး၊ polish က default **60s** ကျော်ရင် ရပြီးသား Gemini draft ကိုပဲ ဆက်သုံးပါတယ်။
 - Default narrator အဖြစ် ရွေးထားတဲ့ **Voice-01** ရဲ့ clean reference (`audio/voice01_clone_reference.wav`) ကို ElevenLabs Instant Voice Clone နဲ့ ပထမအသုံးပြုချိန်မှာ clone လုပ်ပြီး ရလာတဲ့ voice ID ကို cache ထားပါတယ်။ Arena preview ID ကို provider API မှာ တိုက်ရိုက်သုံးတာမဟုတ်ဘဲ၊ အဲဒီ 01 အသံရဲ့ reference audio ကို cloning အတွက် သုံးတာပါ။
 - Cloned voice ရရင် အဲဒီအသံကို Recap အတွက် ဦးစားပေးသုံးပါတယ်။ Clone မရရင် **Gemini TTS `Charon`** → ElevenLabs deep male → Edge မြန်မာအသံ အစဉ်အတိုင်း fallback လုပ်ပါတယ်။
 - Voice message/audio file ကို `/clonevoice` caption နဲ့ပို့တာ (သို့) audio ကို reply လုပ်ပြီး `/clonevoice` ပို့တာနဲ့ custom clone လုပ်နိုင်ပါတယ်။ အနည်းဆုံး ၁၀ စက္ကန့်၊ အများဆုံး 20MB လက်ခံပြီး ၃ မိနစ်ထက်ကြာရင် ပထမ ၃ မိနစ်ကို သုံးပါတယ်။ အကောင်းဆုံးအတွက် တစ်ယောက်တည်း၊ music မပါတဲ့ ၁–၂ မိနစ် sample သုံးပါ။ **ကိုယ့်အသံ သို့မဟုတ် ခွင့်ပြုချက်ရထားတဲ့ အသံကိုသာ clone လုပ်ပါ။**
 - Custom clone က chat တစ်ခုချင်းစီအတွက် သုံးပြီး `/voice01` နဲ့ default သို့ ပြန်နိုင်ပါတယ်။ `data/voice_clones.json` မှာ voice ID/cache metadata ပဲ သိမ်းပြီး reference audio နဲ့ API key ကို မသိမ်းပါဘူး။
 - **Voice Test** ခလုတ်/`/voicetest` က active narrator ကို resolve လုပ်ပြီး TTS sample တစ်ခုကို MP3 အဖြစ် ပြန်ပို့တဲ့အတွက် Recap မစခင် အသံကို အရင်စမ်းနိုင်ပါတယ်။ **Charon Deep** ခလုတ်/`/usecharon` နဲ့လည်း chat တစ်ခုချင်းစီမှာ voice clone မသုံးဘဲ Charon ကို ပြောင်းနိုင်ပါတယ်။
+
+## Four-worker quality pipeline
+
+- Default `PIPELINE_WORKERS=4` ဖြစ်ပြီး အများဆုံး ၄ ခုအထိသာ ခွင့်ပြုပါတယ်။ Speed တစ်ခုထဲအစား အပိုင်းတစ်ခုချင်း စិစစ်အောင် လုပ်ဖို့ ရည်ရွယ်ထားတဲ့အတွက် processing time၊ provider request အရေအတွက်၊ CPU နဲ့ disk usage တိုးနိုင်ပါတယ်။ `PIPELINE_WORKERS=1` ဆိုရင် Script → Voiceover → Rendering အားလုံးမှာ ယခင် sequential path ကို သုံးပါတယ်။
+- **Script:** Lead editor တစ်ခုက audio အပြည့်ကို နားထောင်ပြီး shared story map အရင်လုပ်ပါတယ်။ Gemini audio reference ကို တစ်ခါပဲ prepare လုပ်ပြီး worker ၄ ခုက မတူညီတဲ့ timeline ranges ကို shared map နဲ့ original first-person prompt အတိုင်း ရေးပါတယ်။ Range အပြည့်မရသေးတာ/invalid blocks ဆိုရင် corrective retry တစ်ခါလုပ်ပြီး၊ မအောင်မြင်ရင် incomplete script ကို မလက်ခံဘဲ one-pass full-story fallback ကို သုံးပါတယ်။ နောက်ဆုံးမှာ worker order အတိုင်း merge လုပ်ပြီး timestamps နဲ့ ၈၀% narration window ကို ထပ်စစ်ပါတယ်။
+- **Voiceover:** Locked script ပြီးမှသာ စတင်ပါတယ်။ ပထမ segment က provider/resolved Voice-01 ID ကို lock လုပ်ပြီး နောက် segment တွေက အဲဒီ setting ကို share ပါတယ်။ TTS synthesis နဲ့ silence trimming ကို တစ်ခါအများဆုံး ၄ segment လုပ်ပြီး၊ ordered mixer တစ်ခုကပဲ timing/atempo/fade/PCM placement ကို script order အတိုင်း ဆက်လုပ်ပါတယ်။ Temporary prepared files ကို batch အလိုက် ရှင်းတဲ့အတွက် video ရှည်လေလေ RAM ထဲမှာ segment အကုန်စုပ်တာမဟုတ်ပါဘူး။ Gemini/ElevenLabs/Edge fallback တွေကို ဆက်ထားပါတယ်။
+- **Rendering:** Timeline ကို ordered parts ၄ ခုခွဲပြီး bitrate/resolution/codec/audio settings ကို global တစ်ခုအတိုင်း သုံးပါတယ်။ Video နဲ့ dubbed audio နှစ်ခုလုံးကို တူညီတဲ့ range မှာ seek လုပ်ပြီး part တစ်ခုချင်းရဲ့ duration/audio/video ကို စစ်ပါတယ်။ ပြီးမှ concat list အတိုင်း stream-copy join လုပ်ကာ joined duration နဲ့ streams ကို ထပ်စစ်ပါတယ်။ Target size ကွာရင် corrective pass 2/2 လုပ်ပြီး parallel path မအောင်မြင်ရင် original sequential encoder ကို fallback လုပ်ပါတယ်။ Telegram-safe ordered splitting က မူလအတိုင်းပါပါတယ်။
+- Script/Voiceover/Render worker counts၊ completed parts၊ aggregate timeline %/speed/MB၊ ordered join နဲ့ validation ကို structured card တစ်ခုထဲမှာပဲ ပြပါတယ်။ DYY ကလည်း ထို့ card/events ကိုပဲ ဆက်စစ်ပြီး message အသစ်အများကြီး မပို့ပါဘူး။
+- Render worker တစ်ခုချင်းရဲ့ x264 threads ကို default `1` ထားပြီး shared/container CPU မှာ host CPU count ကိုကြည့်ပြီး oversubscribe မဖြစ်စေပါဘူး။ Guaranteed CPU ပိုရှိတဲ့ deployment ဆိုရင် `RENDER_THREADS_PER_WORKER` ကို တိုးနိုင်ပါတယ်။ Corrective parallel attempt တစ်ခုမှာ previous best + current parts + current joined file တို့ တစ်ပြိုင်နက်ရှိနိုင်တဲ့အတွက် handler က target size ရဲ့ ၃ ဆခန့် + audio scratch ကို ကြိုတင် reserve စစ်ပါတယ်။
+
+> Worker ၄ ခုက API request ၄ ခုကို တစ်ပြိုင်နက် ထုတ်နိုင်ပါတယ်။ Script story map၊ corrective retries၊ optional DeepSeek polish နဲ့ slow-model helpers ဟာ quota/cost ကို ထပ်တိုးစေနိုင်ပါတယ်။ Provider rate limit ကြည့်ပြီး `PIPELINE_WORKERS`၊ `GEMINI_SCRIPT_MAX_PARALLEL` နဲ့ `RENDER_THREADS_PER_WORKER` ကို instance နဲ့ ကိုက်ညီအောင် ညှိပါ။
 
 ## Source credit နဲ့ copyright context
 
@@ -70,10 +81,12 @@ Repository ထဲမှာ `Dockerfile` နဲ့ `render.yaml` ပါပြီ�
 | `GEMINI_TTS_VOICE` | Default `Charon` |
 | `GEMINI_TTS_MODELS` | Default `gemini-3.8-flash-tts,gemini-2.5-flash-tts` |
 | `DEEPSEEK_MODEL` | Default `deepseek-flash` |
-| `GEMINI_SCRIPT_MAX_PARALLEL` | Default `3` (cap 3) — primary + slow-response helpers; `1` ဖြင့် sequential-only သုံးနိုင်တယ် |
+| `GEMINI_SCRIPT_MAX_PARALLEL` | Default `3` (cap 3) — တစ်ခုချင်း generation ရဲ့ primary + slow-response helpers; `1` ဖြင့် အဲဒီ helpers ကို ပိတ်နိုင်တယ် (pipeline အပြည့် sequential အတွက် `PIPELINE_WORKERS=1`) |
 | `GEMINI_SCRIPT_HELPER_DELAY_SECONDS` | Default `20` — primary/helper response ကို စောင့်ပြီး နောက် helper တစ်ခု ထပ်စတင်ရန် |
 | `GEMINI_SCRIPT_MODEL_TIMEOUT` | Default `180` seconds — model request တစ်ခုချင်းရဲ့ timeout |
 | `DEEPSEEK_POLISH_TIMEOUT` | Default `60` seconds — optional polish ကြာရင် Gemini draft ကို ဆက်သုံးရန် |
+| `PIPELINE_WORKERS` | Default `4`, cap `4` — Script/Voiceover/Rendering အတွက် shared worker limit; `1` ဖြင့် pipeline အပြည့် sequential fallback |
+| `RENDER_THREADS_PER_WORKER` | Default `1` — render worker တစ်ခုချင်းရဲ့ x264 threads; guaranteed CPU ပိုရှိရင် positive integer အဖြစ် တိုးနိုင်တယ် |
 | `ELEVENLABS_MODEL` | Default `eleven_v4` |
 | `ELEVENLABS_VOICE_ID` | Optional — သီးသန့် ElevenLabs custom/clone voice ID; cloning enabled ဆိုရင် auto Voice-01 ထက် ဦးစားပေးတယ် (`/voice01` က chat အလိုက် override လုပ်နိုင်တယ်) |
 | `ELEVENLABS_VOICE_NAME` | Default `Adam`; voice ID မထည့်ရင် အဲဒီနာမည်နဲ့ ရှာတယ် |
@@ -107,7 +120,7 @@ Health check path က `/health` ဖြစ်ပြီး service စတင်ပ
 
 ## Tests
 
-API call မလုပ်ဘဲ script prompt၊ Gemini slow-helper race/cancellation၊ DeepSeek timeout fallback၊ JSON parsing၊ PCM handling၊ voice-clone multipart/cache/provider priority၊ Telegram clone command၊ inline Voice Lab buttons၊ Voice Test audio upload၊ MB progress card၊ 60s watchdog၊ automatic/manual retry၊ DYY always-on/start guide/context-aware next steps/event isolation၊ source-credit/rights captions၊ target-size encoding correction၊ real subprocess FFmpeg-progress stream/stall cleanup နဲ့ Telegram splitting logic ကို စမ်းနိုင်ပါတယ်။
+API call မလုပ်ဘဲ script prompt၊ four-way gapless ranges၊ shared story map/audio reference၊ worker retry/full-story fallback၊ 80% timing fit၊ Voice-01/provider lock နဲ့ ordered audio mixing၊ four-part common encoding settings/ordered join/stream validation/sequential fallback၊ Gemini slow-helper race/cancellation၊ DeepSeek timeout fallback၊ JSON parsing၊ PCM handling၊ voice-clone multipart/cache/provider priority၊ Telegram clone command၊ inline Voice Lab buttons၊ Voice Test audio upload၊ MB progress card၊ 60s watchdog၊ automatic/manual retry၊ DYY always-on/start guide/context-aware next steps/event isolation၊ source-credit/rights captions၊ target-size encoding correction၊ real subprocess FFmpeg-progress stream/stall cleanup နဲ့ Telegram splitting logic ကို စမ်းနိုင်ပါတယ်။ Media/provider tests အများကြီးက mocks/local files ကို သုံးထားတဲ့အတွက် ဒီ suite အောင်တာက live Gemini/ElevenLabs/FFmpeg/Telegram end-to-end production validation ကို အစားမထိုးပါဘူး။
 
 ```bash
 python -m unittest discover -s tests -v
