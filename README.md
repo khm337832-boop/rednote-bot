@@ -11,9 +11,12 @@ Rednote (小红书) video link ကို Telegram bot ဆီ ပို့လိ�
 - `/voicetest` — လက်ရှိရွေးထားတဲ့ narrator နဲ့ short Myanmar audio sample ထုတ်ပြီး Telegram မှာ ပြန်ပို့ပါတယ်။
 - `/voice01` — Custom clone ကိုဖြုတ်ပြီး bundled Voice-01 default reference ကို ပြန်သုံးပါတယ်။
 - `/usecharon` — ဒီ chat အတွက် voice clone ကို bypass လုပ်ပြီး Charon Deep voice ကို သုံးပါတယ်။
-- Main menu မှာ **New Recap, Clone Voice, Voice-01, Voice Test, Voice Lab, Help, Status** inline buttons ပါပါတယ်။
+- `/dyy` — DYY Agent ရဲ့ detailed monitoring reports ကို ဒီ chat အတွက် ON/OFF လုပ်ပါတယ်။ Main progress card ကတော့ OFF လုပ်ထားလည်း ဆက်အလုပ်လုပ်ပါတယ်။
+- Main menu မှာ **New Recap, Clone Voice, Voice-01, Voice Test, Voice Lab, DYY Agent, Help, Status** inline buttons ပါပါတယ်။
 - **Voice Lab** ထဲမှာ Clone Voice, Voice Test, Voice-01, Charon Deep, Main Menu, Status buttons ရှိပြီး active narrator ကိုပါ ပြပါတယ်။
 - Job progress ကို `DOWNLOADING → SCRIPT WRITING → VOICEOVER → RENDERING → UPLOADING` structured card တစ်ခုထဲမှာ ပြပါတယ်။ Download/render မှာ **MB + progress bar**၊ voiceover မှာ segment count၊ upload မှာ part count နဲ့ delivered MB ပါပါတယ်။
+- Built-in **DYY Agent** က အဲဒီ job events ကိုပဲ စောင့်ကြည့်ပြီး user ကို **“ဆရာ”** ဟု ခေါ်ကာ stage transitions၊ stage completion၊ retries၊ watchdog checks၊ errors နဲ့ final success ကို အသေးစိတ် report ပို့ပါတယ်။ Added paid AI service/API key မလိုပါဘူး။ မိနစ်ပိုင်းလိုက်/byte ပိုင်းလိုက်ပြောင်းတဲ့ frequent MB updates ကိုတော့ message အများကြီး မပို့ဘဲ structured progress card ထဲမှာပဲ ထားပါတယ်။
+- `/dyy` preference က chat-by-chat memory-only ဖြစ်ပြီး server restart/redeploy ရင် `DYY_AGENT_ENABLED` default သို့ ပြန်ရောက်ပါမယ်။ Monitoring message ပို့တာ error တစ်ခု ဖြစ်ရင်လည်း Recap job ကို မရပ်စေပါဘူး။
 - Progress silence **၆၀ စက္ကန့်** ရှိရင် watchdog က job task/file-size activity ကို စစ်ပြီး card မှာ အသိပေးပါတယ်။ Legitimate long-running job ကို silence တစ်ခုတည်းနဲ့ ချက်ချင်း fail မလုပ်ပါဘူး။
 - Timeout/network/rate-limit အစရှိတဲ့ transient errors ကို configurable attempts နဲ့ automatic retry လုပ်ပါတယ်။ No audio/disk full/api key အစရှိတဲ့ permanent errors ကို automatic retry မလုပ်ပါဘူး။
 - Job fail ဖြစ်ရင် **🔄 Retry Job** inline button ပါပါတယ်။ Button က မူရင်း link ကနေ job အသစ် restart လုပ်ပေးပြီး၊ retry data က memory-only ဖြစ်ပြီး TTL သတ်မှတ်ထားပါတယ်။ Server restart နောက်ပိုင်း expired button ဆိုရင် link ပြန်ပို့ရပါမယ်။
@@ -31,6 +34,12 @@ Rednote (小红书) video link ကို Telegram bot ဆီ ပို့လိ�
 - Voice message/audio file ကို `/clonevoice` caption နဲ့ပို့တာ (သို့) audio ကို reply လုပ်ပြီး `/clonevoice` ပို့တာနဲ့ custom clone လုပ်နိုင်ပါတယ်။ အနည်းဆုံး ၁၀ စက္ကန့်၊ အများဆုံး 20MB လက်ခံပြီး ၃ မိနစ်ထက်ကြာရင် ပထမ ၃ မိနစ်ကို သုံးပါတယ်။ အကောင်းဆုံးအတွက် တစ်ယောက်တည်း၊ music မပါတဲ့ ၁–၂ မိနစ် sample သုံးပါ။ **ကိုယ့်အသံ သို့မဟုတ် ခွင့်ပြုချက်ရထားတဲ့ အသံကိုသာ clone လုပ်ပါ။**
 - Custom clone က chat တစ်ခုချင်းစီအတွက် သုံးပြီး `/voice01` နဲ့ default သို့ ပြန်နိုင်ပါတယ်။ `data/voice_clones.json` မှာ voice ID/cache metadata ပဲ သိမ်းပြီး reference audio နဲ့ API key ကို မသိမ်းပါဘူး။
 - **Voice Test** ခလုတ်/`/voicetest` က active narrator ကို resolve လုပ်ပြီး TTS sample တစ်ခုကို MP3 အဖြစ် ပြန်ပို့တဲ့အတွက် Recap မစခင် အသံကို အရင်စမ်းနိုင်ပါတယ်။ **Charon Deep** ခလုတ်/`/usecharon` နဲ့လည်း chat တစ်ခုချင်းစီမှာ voice clone မသုံးဘဲ Charon ကို ပြောင်းနိုင်ပါတယ်။
+
+## Source credit နဲ့ copyright context
+
+- Delivered video ရဲ့ **ပထမ part caption** မှာ မူရင်း source link နဲ့ first-person recap/commentary ဖြစ်ကြောင်း၊ မူရင်းပိုင်ဆိုင်မှုများသည် မူရင်းပိုင်ရှင်များဆီသာဖြစ်ကြောင်း rights notice ထည့်ပါတယ်။ Part အများကြီးဖြစ်ရင် နောက်ပိုင်း captions ကို short ထားပြီး ordered delivery ကို ဆက်လုပ်ပါတယ်။
+- ဒီ attribution/notice က **100% copyright shield မဟုတ်ပါဘူး**။ Content ID/copyright claim၊ takedown သို့မဟုတ် တရားဝင်တာဝန်ကို အလိုအလျောက် ကာကွယ်ပေးတာလည်း မဟုတ်ပါဘူး။ ခွင့်ပြုချက်ရထားတဲ့၊ ကိုယ်ပိုင်၊ public-domain သို့မဟုတ် applicable law အရ အသုံးပြုခွင့်ရှိတဲ့ source ကိုသာ သုံးပါ။
+- `SOURCE_CREDIT_ENABLED=false` နဲ့ source link ကို၊ `COPYRIGHT_NOTICE_ENABLED=false` နဲ့ rights notice ကို သီးသန့်ပိတ်နိုင်ပါတယ်။ ပိတ်ထားတာကလည်း copyright status ကို မပြောင်းပါဘူး။
 
 ## GB ကြီးတဲ့ video နဲ့ output size
 
@@ -68,6 +77,9 @@ Repository ထဲမှာ `Dockerfile` နဲ့ `render.yaml` ပါပြီ�
 | `VOICE_CLONE_CACHE_PATH` | Default `data/voice_clones.json`; cloned voice IDs နဲ့ per-chat selections သိမ်းရာနေရာ (persistent disk ရှိရင် path ပြောင်းနိုင်တယ်) |
 | `VOICE_CLONE_MAX_BYTES` | Default `20000000`; Telegram reference အများဆုံး file size |
 | `VOICE_CLONE_MAX_SECONDS` | Default `180`; reference ကို အဲဒီမိနစ်အထိ trim လုပ်တယ် |
+| `DYY_AGENT_ENABLED` | Default `true`; DYY detailed event reports ရဲ့ chat default; `/dyy` ဖြင့် chat-by-chat ON/OFF လုပ်နိုင်တယ် |
+| `SOURCE_CREDIT_ENABLED` | Default `true`; delivered ပထမ part caption မှာ မူရင်း source link ထည့်ရန် |
+| `COPYRIGHT_NOTICE_ENABLED` | Default `true`; delivered ပထမ part caption မှာ recap/rights context ထည့်ရန်; copyright immunity ကို မပေးပါဘူး |
 | `FINAL_SIZE_RATIO` | Default `0.8` — မူရင်း file size ရဲ့ ၈၀% |
 | `SCRIPT_DURATION_RATIO` | Default `0.8` — narration window budget; ဇာတ်လမ်းအဆုံးကိုတော့ မဖြတ်ဘူး |
 | `MAX_VIDEO_MINUTES` | Default `0` — fixed duration limit မထားဘူး |
@@ -90,7 +102,7 @@ Health check path က `/health` ဖြစ်ပြီး service စတင်ပ
 
 ## Tests
 
-API call မလုပ်ဘဲ script prompt၊ JSON parsing၊ PCM handling၊ voice-clone multipart/cache/provider priority၊ Telegram clone command၊ inline Voice Lab buttons၊ Voice Test audio upload၊ MB progress card၊ 60s watchdog၊ automatic/manual retry၊ target-size encoding correction နဲ့ Telegram splitting logic ကို စမ်းနိုင်ပါတယ်။
+API call မလုပ်ဘဲ script prompt၊ JSON parsing၊ PCM handling၊ voice-clone multipart/cache/provider priority၊ Telegram clone command၊ inline Voice Lab buttons၊ Voice Test audio upload၊ MB progress card၊ 60s watchdog၊ automatic/manual retry၊ DYY salutation/ON-OFF/event isolation၊ source-credit/rights captions၊ target-size encoding correction နဲ့ Telegram splitting logic ကို စမ်းနိုင်ပါတယ်။
 
 ```bash
 python -m unittest discover -s tests -v

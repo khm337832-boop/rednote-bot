@@ -102,12 +102,28 @@ PROGRESS_STALL_SECONDS = env_int("PROGRESS_STALL_SECONDS", 60, 15)
 JOB_MAX_ATTEMPTS = env_int("JOB_MAX_ATTEMPTS", 3, 1)
 JOB_RETRY_DELAY_SECONDS = env_int("JOB_RETRY_DELAY_SECONDS", 5, 1)
 RETRY_JOB_TTL_SECONDS = env_int("RETRY_JOB_TTL_SECONDS", 86400, 60)
+DYY_AGENT_ENABLED = os.environ.get("DYY_AGENT_ENABLED", "true").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
+SOURCE_CREDIT_ENABLED = os.environ.get("SOURCE_CREDIT_ENABLED", "true").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
+COPYRIGHT_NOTICE_ENABLED = os.environ.get(
+    "COPYRIGHT_NOTICE_ENABLED", "true"
+).strip().lower() not in {"0", "false", "no", "off"}
 
 processed_updates = deque(maxlen=500)
 job_semaphore = asyncio.Semaphore(1)
 voice_clone_lock = asyncio.Lock()
 background_jobs = set()
 retry_jobs = {}
+dyy_preferences = {}
 voice01_clone_id = ""
 
 
@@ -184,7 +200,10 @@ async def tg_api(method: str, data: dict = None, files: dict = None, timeout: fl
 def bot_menu_keyboard() -> dict:
     return {
         "inline_keyboard": [
-            [{"text": "🎬 Recap စလုပ်မယ်", "callback_data": "new_recap"}],
+            [
+                {"text": "🎬 Recap စလုပ်မယ်", "callback_data": "new_recap"},
+                {"text": "🕵️ DYY Agent", "callback_data": "dyy"},
+            ],
             [
                 {"text": "🎙️ Clone Voice", "callback_data": "clone_voice"},
                 {"text": "🗣️ Voice-01", "callback_data": "voice01"},
@@ -224,7 +243,7 @@ def welcome_message() -> str:
     return (
         "<b>🎬 REDNOTE MM RECAP</b>\n"
         "<i>First-person Myanmar storytelling, ready for you.</i>\n\n"
-        "မင်္ဂလာပါ! ကြိုက်တဲ့ Rednote (小红书) video link ကို "
+        "မင်္ဂလာပါ ဆရာ! ကြိုက်တဲ့ Rednote (小红书) video link ကို "
         "<b>ဒီထဲမှာ တစ်ခုချင်း ပို့လိုက်ပါ</b>။\n\n"
         "<b>✨ Bot က လုပ်ပေးမယ့်အရာတွေ</b>\n"
         "┣ 📥 GB ကြီးတဲ့ video တွေကိုပါ ဒေါင်းလုဒ်ဆွဲမယ်\n"
@@ -233,6 +252,7 @@ def welcome_message() -> str:
         "┣ 🎧 <b>Voice Test / Voice Lab</b> ခလုတ်တွေနဲ့ အသံစမ်းနိုင်တယ်\n"
         "┣ 🎞️ Final size ကို မူရင်းရဲ့ <b>၈၀% ခန့်</b> လျှော့မယ်\n"
         "┣ 🛡️ <b>MB progress + 60s watchdog + Retry</b> ပါမယ်\n"
+        "┣ 🕵️ <b>DYY Agent</b> က ဆရာ့ကို detailed reports ပြန်ပို့မယ်\n"
         "┗ 📤 50MB ကျော်ရင် MP4 အပိုင်းလိုက် အလိုအလျောက် ပို့မယ်\n\n"
         "<b>📮 ဥပမာ</b>\n"
         "<code>http://xhslink.com/...</code>"
@@ -288,7 +308,8 @@ def help_message() -> str:
         "┣ /clonevoice — ကိုယ်ပိုင်/ခွင့်ပြုထားတဲ့ အသံကို clone လုပ်ရန်\n"
         "┣ /voicetest — ရွေးထားတဲ့ narrator နဲ့ sample နားထောင်ရန်\n"
         "┣ /voice01 — Voice-01 default clone ကို ပြန်သုံးရန်\n"
-        "┗ /usecharon — Charon Deep voice ကို ပြောင်းသုံးရန်\n\n"
+        "┣ /usecharon — Charon Deep voice ကို ပြောင်းသုံးရန်\n"
+        "┗ /dyy — DYY monitoring reports ကို ON/OFF လုပ်ရန်\n\n"
         "<b>✨ Inline buttons</b>\n"
         "Main menu က <b>Clone Voice, Voice Test, Voice Lab, New Recap</b> ခလုတ်တွေကိုလည်း "
         "တစ်ချက်နှိပ်ပြီး အသုံးပြုနိုင်ပါတယ်။\n\n"
@@ -296,6 +317,9 @@ def help_message() -> str:
         "Voice message သို့မဟုတ် audio file ကို <code>/clonevoice</code> caption နဲ့ ပို့ပါ။ "
         "တစ်ယောက်တည်း၊ background music မပါတဲ့ ၁–၂ မိနစ် sample က အကောင်းဆုံးပါ။ "
         "သင့်အသံ သို့မဟုတ် ခွင့်ပြုချက်ရထားတဲ့ အသံကိုသာ သုံးပါ။\n\n"
+        "<b>🛡️ Copyright Note</b>\n"
+        "First-person recap/commentary နဲ့ source credit ထည့်ပေးပေမယ့် ၎င်းက copyright-free "
+        "ဖြစ်ကြောင်း သို့မဟုတ် claim လုံးဝမဖြစ်ကြောင်း အာမမခံပါဘူး။ အသုံးပြုခွင့်ရှိတဲ့ content ကိုသာ သုံးပါ။\n\n"
         "<b>💡 Progress & Retry</b>\n"
         "Job card မှာ stage တစ်ဆင့်ချင်းနဲ့ MB/segment progress ကို ပြပါတယ်။ "
         "Progress silence ၆၀ စက္ကန့်ရှိရင် watchdog စစ်ပါတယ်။ Transient error ဆို auto retry၊ "
@@ -308,6 +332,8 @@ def status_message(chat_id: int = None) -> str:
     queue_status = "🟠 Processing" if job_semaphore.locked() else "🟢 Ready"
     deepseek_status = "On" if DEEPSEEK_API_KEY else "Off"
     elevenlabs_status = "On" if ELEVENLABS_API_KEY else "Off"
+    dyy_status = is_dyy_enabled(chat_id) if chat_id is not None else DYY_AGENT_ENABLED
+    dyy_status = "On" if dyy_status else "Off"
     if not VOICE_CLONE_ENABLED:
         clone_status = "Off"
         voice_label = f"{GEMINI_TTS_VOICE} + fallback"
@@ -335,6 +361,7 @@ def status_message(chat_id: int = None) -> str:
         f"┣ <b>Script timing:</b> Video ရဲ့ {int(SCRIPT_DURATION_RATIO * 100)}% ခန့်\n"
         f"┣ <b>DeepSeek polish:</b> {deepseek_status}\n"
         f"┣ <b>ElevenLabs fallback:</b> {elevenlabs_status}\n"
+        f"┣ <b>DYY Agent:</b> {dyy_status}\n"
         f"┣ <b>Watchdog / Retry:</b> {PROGRESS_STALL_SECONDS}s / {JOB_MAX_ATTEMPTS} attempts\n"
         f"┗ <b>Final size:</b> မူရင်းရဲ့ {int(FINAL_SIZE_RATIO * 100)}% ခန့်\n\n"
         "<i>Link တစ်ခု ပို့ပြီး Recap စတင်နိုင်ပါပြီ။</i>"
@@ -394,6 +421,7 @@ async def register_webhook(base_url: str) -> dict:
                     {"command": "voicetest", "description": "🎧 Narrator sample ကို နားထောင်မယ်"},
                     {"command": "voice01", "description": "🗣️ Voice-01 default ကို သုံးမယ်"},
                     {"command": "usecharon", "description": "🎚️ Charon Deep voice ကို သုံးမယ်"},
+                    {"command": "dyy", "description": "🕵️ DYY monitoring reports ON/OFF"},
                 ]
             },
         )
@@ -635,6 +663,8 @@ async def telegram_webhook(request: Request):
                         reply_markup=voice_lab_keyboard(),
                     )
                 )
+            elif action == "dyy":
+                schedule_background(handle_dyy_toggle(chat_id, reply_id))
             elif action == "voice_test":
                 schedule_background(handle_voice_preview(chat_id, reply_id))
             elif action == "voice01":
@@ -697,6 +727,10 @@ async def telegram_webhook(request: Request):
 
     if command == "/voicetest":
         schedule_background(handle_voice_preview(chat_id, msg_id))
+        return JSONResponse({"ok": True})
+
+    if command == "/dyy":
+        schedule_background(handle_dyy_toggle(chat_id, msg_id))
         return JSONResponse({"ok": True})
 
     url_match = re.search(r"https?://[^\s，。！？,<>\"'；：）】]+", text)
@@ -2088,6 +2122,11 @@ async def run_with_retries(operation, progress, stage: str):
                 str(exc)[:140],
             )
             progress.notice = f"Attempt {attempt} failed; automatic retry is starting."
+            await progress.emit(
+                "retry",
+                detail=f"{stage} attempt {attempt} failed: {str(exc)[:180]}",
+                stage=stage,
+            )
             await progress.update(
                 detail=f"Attempt {attempt} failed · retrying {stage}…",
                 force=True,
@@ -2096,13 +2135,109 @@ async def run_with_retries(operation, progress, stage: str):
     raise last_error
 
 
+def is_dyy_enabled(chat_id: int) -> bool:
+    if chat_id is None:
+        return DYY_AGENT_ENABLED
+    return dyy_preferences.get(chat_id, DYY_AGENT_ENABLED)
+
+
+class DYYAgent:
+    """Built-in job observer that sends detailed, respectful reports to the user."""
+
+    def __init__(self, chat_id: int):
+        self.chat_id = chat_id
+
+    async def report(self, event: dict) -> None:
+        if not is_dyy_enabled(self.chat_id):
+            return
+        kind = event.get("event", "stage")
+        titles = {
+            "stage": "လက်ရှိအဆင့်ကို စတင်လုပ်ဆောင်နေပါတယ်။",
+            "complete": "အဆင့်တစ်ခု ပြီးစီးသွားပါပြီ။",
+            "retry": "ယာယီအခက်အခဲကြောင့် automatic retry လုပ်နေပါတယ်။",
+            "watchdog": "Progress silence ကို watchdog စစ်ဆေးနေပါတယ်။",
+            "fail": "Job ရပ်သွားပါတယ်။",
+            "success": "Recap အပြည့်အစုံ ပြီးစီးပါပြီ။",
+        }
+        title = titles.get(kind, "Job အခြေအနေကို စောင့်ကြည့်နေပါတယ်။")
+        stage = event.get("stage", "")
+        stage_label = dict(JOB_STAGES).get(stage, stage or "General")
+        detail = str(event.get("detail", ""))[:320]
+        lines = [
+            f"<b>🕵️ DYY AGENT</b> · <code>#{html.escape(str(event.get('job_id', '')))}</code>",
+            f"ဆရာ၊ <b>{html.escape(title)}</b>",
+            "",
+            f"┣ <b>Stage:</b> {html.escape(stage_label)}",
+            f"┣ <b>အသေးစိတ်:</b> {html.escape(detail)}",
+            f"┗ <b>Attempt:</b> {event.get('attempt', 1)}",
+        ]
+        current = event.get("current")
+        total = event.get("total")
+        if current is not None:
+            metric = format_mb(current)
+            if total:
+                metric += f" / {format_mb(total)}"
+            lines.append(f"<b>Data:</b> {metric}")
+        if kind == "watchdog":
+            lines.append(
+                f"<b>Silence:</b> {int(event.get('idle_seconds', 0))}s · "
+                "task/byte activity ကို ဆက်စစ်နေပါတယ်။"
+            )
+        elif kind == "fail":
+            lines.append("ဆရာ၊ Retry Job ခလုတ်ကိုသုံးပြီး မူရင်း link ကနေ ပြန်စနိုင်ပါတယ်။")
+        elif kind == "success":
+            lines.append("ဆရာ၊ delivery အထိ အားလုံးပြီးဆုံးသွားပါပြီ။")
+        await send_text(self.chat_id, "\n".join(lines))
+
+
+async def handle_dyy_toggle(chat_id: int, reply_msg_id: int) -> None:
+    new_state = not is_dyy_enabled(chat_id)
+    dyy_preferences[chat_id] = new_state
+    if new_state:
+        message = (
+            "ဆရာ၊ <b>DYY Agent ကို ON</b> လုပ်ပြီးပါပြီ။ Stage changes၊ retries၊ "
+            "watchdog checks၊ errors နဲ့ completion reports ကို အသေးစိတ်ပြန်ပို့ပါမယ်။"
+        )
+    else:
+        message = (
+            "ဆရာ၊ <b>DYY Agent ကို OFF</b> လုပ်ပြီးပါပြီ။ Main progress card ကတော့ "
+            "ပုံမှန်အတိုင်း ဆက်ပြနေပါမယ်။"
+        )
+    await send_text(
+        chat_id,
+        f"<b>🕵️ DYY AGENT</b>\n{message}",
+        reply_to=reply_msg_id,
+        reply_markup=bot_menu_keyboard(),
+    )
+
+
+def copyright_caption(url: str, part_number: int) -> str:
+    """Add attribution/rights context without claiming copyright immunity."""
+    if part_number != 1:
+        return ""
+    lines = []
+    if SOURCE_CREDIT_ENABLED:
+        if len(url) <= 450:
+            safe_url = html.escape(url, quote=True)
+            lines.append(f'🔗 <a href="{safe_url}">မူရင်း video</a>')
+        else:
+            lines.append("🔗 မူရင်း Rednote video")
+    if COPYRIGHT_NOTICE_ENABLED:
+        lines.append(
+            "<i>First-person recap/commentary။ မူရင်းပိုင်ဆိုင်မှုများသည် "
+            "မူရင်းပိုင်ရှင်များအတွက်သာ။</i>"
+        )
+    return "\n\n" + "\n".join(lines) if lines else ""
+
+
 class JobProgress:
     """A throttled Telegram progress card with byte monitoring and a 60s watchdog."""
 
-    def __init__(self, chat_id: int, message_id: int, job_id: str):
+    def __init__(self, chat_id: int, message_id: int, job_id: str, event_callback=None):
         self.chat_id = chat_id
         self.message_id = message_id
         self.job_id = job_id
+        self.event_callback = event_callback
         self.stage = "download"
         self.detail = "Waiting for a worker…"
         self.details = {}
@@ -2128,6 +2263,25 @@ class JobProgress:
     @property
     def idle_seconds(self) -> float:
         return max(0.0, time.monotonic() - self.last_activity)
+
+    async def emit(self, event: str, detail: str = "", stage: str = None) -> None:
+        if not self.event_callback:
+            return
+        payload = {
+            "event": event,
+            "job_id": self.job_id,
+            "stage": stage or self.stage,
+            "detail": detail or self.detail,
+            "current": self.current,
+            "total": self.total,
+            "attempt": self.attempt,
+            "idle_seconds": self.idle_seconds,
+        }
+        try:
+            await self.event_callback(payload)
+        except Exception as exc:
+            # Monitoring must never interrupt the actual recap job.
+            logger.warning("DYY report failed: %s", str(exc)[:120])
 
     def render(self) -> str:
         if self.error:
@@ -2198,6 +2352,7 @@ class JobProgress:
         self.last_activity = time.monotonic()
         self.notice = ""
         await self.refresh(force=force)
+        await self.emit("stage", detail=detail, stage=stage)
 
     async def update(self, detail: str = None, current=None, total=None, force: bool = False):
         changed = False
@@ -2219,6 +2374,7 @@ class JobProgress:
         self.details[stage] = detail
         self.last_activity = time.monotonic()
         await self.refresh(force=force)
+        await self.emit("complete", detail=detail, stage=stage)
 
     def watch_file(self, path: str, total=None) -> None:
         self.watch_path = path
@@ -2275,6 +2431,7 @@ class JobProgress:
             "Retry is offered if the stage actually fails."
         )
         await self.refresh(force=True)
+        await self.emit("watchdog", detail=self.notice, stage=self.stage)
         return True
 
     async def _watchdog_loop(self):
@@ -2296,6 +2453,7 @@ class JobProgress:
         self.finished = True
         self.unwatch()
         await self.refresh(force=True)
+        await self.emit("fail", detail=self.error, stage=self.stage)
 
     async def succeed(self, detail: str):
         for key, _ in JOB_STAGES:
@@ -2305,6 +2463,7 @@ class JobProgress:
         self.detail = detail
         self.unwatch()
         await self.refresh(force=True)
+        await self.emit("success", detail=detail, stage=self.stage)
 
     async def stop(self):
         for task in self.tasks:
@@ -2773,7 +2932,13 @@ async def handle_video_job(chat_id: int, reply_msg_id: int, url: str, job_id: st
         "Worker အလင်းရရင် stage-by-stage MB progress ကို ဒီ card မှာ ပြပါမယ်။",
         reply_to=reply_msg_id,
     )
-    progress = JobProgress(chat_id, status_id, job_id)
+    dyy_agent = DYYAgent(chat_id)
+    progress = JobProgress(
+        chat_id,
+        status_id,
+        job_id,
+        event_callback=dyy_agent.report,
+    )
 
     async with job_semaphore:
         work_dir = None
@@ -2993,6 +3158,7 @@ async def handle_video_job(chat_id: int, reply_msg_id: int, url: str, job_id: st
                 )
                 if total_parts > 1:
                     caption += f" • Part {part_number}/{total_parts}"
+                caption += copyright_caption(url, part_number)
 
                 async def upload_part(part_path=part_path, part_number=part_number, caption=caption):
                     with open(part_path, "rb") as video_file:

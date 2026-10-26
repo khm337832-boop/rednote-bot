@@ -523,6 +523,154 @@ class ProgressAndRetryTests(unittest.TestCase):
                 bot.retry_jobs.pop("failed123", None)
 
 
+class DYYAgentTests(unittest.TestCase):
+    def test_dyy_report_addresses_user_and_escapes_job_details(self):
+        sent = []
+
+        async def fake_send_text(chat_id, text, **kwargs):
+            sent.append((chat_id, text, kwargs))
+            return 88
+
+        event = {
+            "event": "retry",
+            "job_id": "dyy-job",
+            "stage": "download",
+            "detail": "Temporary <network> failure",
+            "current": 2_000_000,
+            "total": 8_000_000,
+            "attempt": 2,
+        }
+        with patch.dict(bot.dyy_preferences, {123: True}, clear=True), patch.object(
+            bot, "send_text", side_effect=fake_send_text
+        ):
+            asyncio.run(bot.DYYAgent(123).report(event))
+
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0][0], 123)
+        self.assertIn("ဆရာ", sent[0][1])
+        self.assertIn("DYY AGENT", sent[0][1])
+        self.assertIn("dyy-job", sent[0][1])
+        self.assertIn("Temporary &lt;network&gt; failure", sent[0][1])
+        self.assertIn("Data:", sent[0][1])
+        self.assertIn("Attempt:</b> 2", sent[0][1])
+
+    def test_dyy_toggle_controls_reports_and_preserves_salutation(self):
+        sent = []
+
+        async def fake_send_text(chat_id, text, **kwargs):
+            sent.append(text)
+            return 88
+
+        async def run_flow():
+            agent = bot.DYYAgent(123)
+            await agent.report({"event": "stage", "detail": "hidden"})
+            await bot.handle_dyy_toggle(123, 10)
+            await agent.report({"event": "stage", "detail": "visible"})
+            await bot.handle_dyy_toggle(123, 10)
+
+        with patch.dict(bot.dyy_preferences, {123: False}, clear=True), patch.object(
+            bot, "send_text", side_effect=fake_send_text
+        ):
+            asyncio.run(run_flow())
+            self.assertFalse(bot.is_dyy_enabled(123))
+
+        self.assertEqual(len(sent), 3)
+        self.assertIn("ON", sent[0])
+        self.assertIn("visible", sent[1])
+        self.assertIn("OFF", sent[2])
+        self.assertTrue(all("ဆရာ" in text for text in sent))
+
+    def test_progress_emits_meaningful_events_but_not_frequent_mb_updates(self):
+        events = []
+
+        async def record(event):
+            events.append(event)
+
+        async def fake_edit_text(*args, **kwargs):
+            return None
+
+        async def run_flow():
+            progress = bot.JobProgress(123, 456, "events123", event_callback=record)
+            await progress.set_stage("download", "Starting", current=0, total=1000)
+            await progress.update(detail="Frequent MB update", current=500)
+            await progress.complete("download", "Download complete")
+            await progress.succeed("Delivered")
+
+        with patch.object(bot, "edit_text", side_effect=fake_edit_text):
+            asyncio.run(run_flow())
+
+        self.assertEqual([event["event"] for event in events], ["stage", "complete", "success"])
+        self.assertTrue(all(event["job_id"] == "events123" for event in events))
+        self.assertNotIn("Frequent MB update", [event["detail"] for event in events])
+
+    def test_watchdog_and_retry_events_reach_dyy(self):
+        events = []
+
+        async def record(event):
+            events.append(event)
+
+        async def fake_edit_text(*args, **kwargs):
+            return None
+
+        attempts = []
+
+        async def operation():
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise bot.RetryableJobError("network timeout")
+            return "ok"
+
+        async def run_flow():
+            progress = bot.JobProgress(123, 456, "watch123", event_callback=record)
+            progress.last_activity -= bot.PROGRESS_STALL_SECONDS + 1
+            await progress.check_watchdog()
+            await bot.run_with_retries(operation, progress, "download")
+
+        with patch.object(bot, "edit_text", side_effect=fake_edit_text), patch.object(
+            bot, "JOB_RETRY_DELAY_SECONDS", 0
+        ):
+            asyncio.run(run_flow())
+
+        self.assertEqual([event["event"] for event in events], ["watchdog", "retry"])
+        self.assertEqual(events[1]["attempt"], 1)
+        self.assertEqual(len(attempts), 2)
+
+    def test_monitoring_failure_cannot_interrupt_progress(self):
+        async def broken_report(event):
+            raise RuntimeError("Telegram monitoring failed")
+
+        async def fake_edit_text(*args, **kwargs):
+            return None
+
+        progress = bot.JobProgress(123, 456, "safe123", event_callback=broken_report)
+        with patch.object(bot, "edit_text", side_effect=fake_edit_text):
+            asyncio.run(progress.set_stage("download", "Job continues"))
+        self.assertEqual(progress.stage, "download")
+        self.assertEqual(progress.detail, "Job continues")
+
+
+class CopyrightCaptionTests(unittest.TestCase):
+    def test_first_part_has_source_attribution_and_rights_notice(self):
+        with patch.object(bot, "SOURCE_CREDIT_ENABLED", True), patch.object(
+            bot, "COPYRIGHT_NOTICE_ENABLED", True
+        ):
+            first = bot.copyright_caption("https://example.com/watch?a=1&b=2", 1)
+            second = bot.copyright_caption("https://example.com/watch?a=1&b=2", 2)
+
+        self.assertIn('<a href="https://example.com/watch?a=1&amp;b=2">', first)
+        self.assertIn("မူရင်းပိုင်ဆိုင်မှုများ", first)
+        self.assertNotIn("100%", first)
+        self.assertNotIn("shield", first.lower())
+        self.assertEqual(second, "")
+
+    def test_copyright_caption_can_be_disabled(self):
+        with patch.object(bot, "SOURCE_CREDIT_ENABLED", False), patch.object(
+            bot, "COPYRIGHT_NOTICE_ENABLED", False
+        ):
+            caption = bot.copyright_caption("https://example.com/video", 1)
+        self.assertEqual(caption, "")
+
+
 class BotInterfaceTests(unittest.TestCase):
     def test_menu_templates_and_keyboard(self):
         welcome = bot.welcome_message()
@@ -540,6 +688,7 @@ class BotInterfaceTests(unittest.TestCase):
             "voice01",
             "voice_test",
             "voice_lab",
+            "dyy",
             "help",
             "status",
         ):
@@ -553,6 +702,7 @@ class BotInterfaceTests(unittest.TestCase):
         self.assertIn("home", lab_callbacks)
         self.assertIn("/status", bot.help_message())
         self.assertIn("/voicetest", bot.help_message())
+        self.assertIn("/dyy", bot.help_message())
 
     def test_voice_clone_sample_detection_rejects_non_audio_documents(self):
         voice = bot.find_telegram_voice_sample(
@@ -763,6 +913,7 @@ class HandlerFlowTests(unittest.TestCase):
     def test_large_video_handler_reaches_telegram_upload(self):
         sent_videos = []
         edits = []
+        dyy_messages = []
         work_directories = []
 
         async def fake_download(url, output):
@@ -803,7 +954,9 @@ class HandlerFlowTests(unittest.TestCase):
         async def fake_split(final, work_dir):
             return [final]
 
-        async def fake_send_text(*args, **kwargs):
+        async def fake_send_text(chat_id, text, *args, **kwargs):
+            if "DYY AGENT" in text:
+                dyy_messages.append(text)
             return 99
 
         async def fake_edit_text(chat_id, message_id, text, reply_markup=None):
@@ -815,7 +968,9 @@ class HandlerFlowTests(unittest.TestCase):
                 self.assertIsNotNone(files)
             return {"ok": True, "result": {"message_id": 100}}
 
-        with patch.object(bot, "download_rednote_video", side_effect=fake_download), patch.object(
+        with patch.dict(bot.dyy_preferences, {123: True}, clear=True), patch.object(
+            bot, "download_rednote_video", side_effect=fake_download
+        ), patch.object(
             bot, "run_cmd", side_effect=fake_run_cmd
         ), patch.object(bot, "get_media_duration", return_value=10.0), patch.object(
             bot, "create_recap_script_gemini", side_effect=fake_script
@@ -834,6 +989,10 @@ class HandlerFlowTests(unittest.TestCase):
 
         self.assertEqual(len(sent_videos), 1)
         self.assertIn("80%", sent_videos[0]["caption"])
+        self.assertIn('href="https://example.com/video"', sent_videos[0]["caption"])
+        self.assertIn("မူရင်းပိုင်ဆိုင်မှုများ", sent_videos[0]["caption"])
+        self.assertTrue(any("Recap အပြည့်အစုံ" in text for text in dyy_messages))
+        self.assertTrue(all("ဆရာ" in text for text in dyy_messages))
         self.assertTrue(any("first-person" in text.lower() for text in edits))
         self.assertTrue(work_directories)
         self.assertFalse(os.path.exists(work_directories[0]))
