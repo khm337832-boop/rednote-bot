@@ -102,12 +102,6 @@ PROGRESS_STALL_SECONDS = env_int("PROGRESS_STALL_SECONDS", 60, 15)
 JOB_MAX_ATTEMPTS = env_int("JOB_MAX_ATTEMPTS", 3, 1)
 JOB_RETRY_DELAY_SECONDS = env_int("JOB_RETRY_DELAY_SECONDS", 5, 1)
 RETRY_JOB_TTL_SECONDS = env_int("RETRY_JOB_TTL_SECONDS", 86400, 60)
-DYY_AGENT_ENABLED = os.environ.get("DYY_AGENT_ENABLED", "true").strip().lower() not in {
-    "0",
-    "false",
-    "no",
-    "off",
-}
 SOURCE_CREDIT_ENABLED = os.environ.get("SOURCE_CREDIT_ENABLED", "true").strip().lower() not in {
     "0",
     "false",
@@ -123,7 +117,6 @@ job_semaphore = asyncio.Semaphore(1)
 voice_clone_lock = asyncio.Lock()
 background_jobs = set()
 retry_jobs = {}
-dyy_preferences = {}
 voice01_clone_id = ""
 
 
@@ -200,10 +193,7 @@ async def tg_api(method: str, data: dict = None, files: dict = None, timeout: fl
 def bot_menu_keyboard() -> dict:
     return {
         "inline_keyboard": [
-            [
-                {"text": "🎬 Recap စလုပ်မယ်", "callback_data": "new_recap"},
-                {"text": "🕵️ DYY Agent", "callback_data": "dyy"},
-            ],
+            [{"text": "🎬 Recap စလုပ်မယ်", "callback_data": "new_recap"}],
             [
                 {"text": "🎙️ Clone Voice", "callback_data": "clone_voice"},
                 {"text": "🗣️ Voice-01", "callback_data": "voice01"},
@@ -241,31 +231,34 @@ def voice_lab_keyboard() -> dict:
 
 def welcome_message() -> str:
     return (
+        "<b>🕵️ DYY AGENT · ALWAYS ON</b>\n"
         "<b>🎬 REDNOTE MM RECAP</b>\n"
-        "<i>First-person Myanmar storytelling, ready for you.</i>\n\n"
-        "မင်္ဂလာပါ ဆရာ! ကြိုက်တဲ့ Rednote (小红书) video link ကို "
-        "<b>ဒီထဲမှာ တစ်ခုချင်း ပို့လိုက်ပါ</b>။\n\n"
-        "<b>✨ Bot က လုပ်ပေးမယ့်အရာတွေ</b>\n"
-        "┣ 📥 GB ကြီးတဲ့ video တွေကိုပါ ဒေါင်းလုဒ်ဆွဲမယ်\n"
-        "┣ ✍️ Main character ကိုယ်တိုင် <b>First-person</b> နဲ့ Recap ပြောမယ်\n"
-        "┣ 🎙️ <b>Voice-01 clone</b> ဦးစားပေး + Charon fallback\n"
-        "┣ 🎧 <b>Voice Test / Voice Lab</b> ခလုတ်တွေနဲ့ အသံစမ်းနိုင်တယ်\n"
-        "┣ 🎞️ Final size ကို မူရင်းရဲ့ <b>၈၀% ခန့်</b> လျှော့မယ်\n"
-        "┣ 🛡️ <b>MB progress + 60s watchdog + Retry</b> ပါမယ်\n"
-        "┣ 🕵️ <b>DYY Agent</b> က ဆရာ့ကို detailed reports ပြန်ပို့မယ်\n"
-        "┗ 📤 50MB ကျော်ရင် MP4 အပိုင်းလိုက် အလိုအလျောက် ပို့မယ်\n\n"
-        "<b>📮 ဥပမာ</b>\n"
-        "<code>http://xhslink.com/...</code>"
+        "<i>ဆရာ့ရဲ့ live Recap guide & monitor</i>\n\n"
+        "မင်္ဂလာပါ ဆရာ။ ကျွန်တော် DYY ပါ။ ဆရာ ဘာမှ command ထပ်ရိုက်စရာမလိုပါဘူး။\n\n"
+        "<b>ဆရာ အသုံးပြုရမယ့်ပုံ</b>\n"
+        "<b>၁။</b> Rednote App ထဲက <b>Share → Copy Link</b> ကိုနှိပ်ပါ။\n"
+        "<b>၂။</b> ရလာတဲ့ video link ကို ဒီ chat ထဲမှာ တစ်ခုချင်း ပို့ပါ။\n"
+        "<b>၃။</b> Link ရောက်ပြီဆိုတာနဲ့ ကျန်တာအကုန် ကျွန်တော်က ဆက်လုပ်ပေးပါမယ်။\n\n"
+        "<b>🤖 DYY က အလိုအလျောက် လုပ်ပေးမယ့်အရာတွေ</b>\n"
+        "┣ 📥 Video download နဲ့ MB progress ကို စောင့်ကြည့်မယ်\n"
+        "┣ ✍️ Main character ရဲ့ <b>First-person</b> မြန်မာ Recap ရေးမယ်\n"
+        "┣ 🎙️ Voice-01 clone / Charon fallback နဲ့ narration လုပ်မယ်\n"
+        "┣ 🎞️ Final size <b>၈၀% ခန့်</b> ထိန်းပြီး Telegram-safe MP4 ပြန်ပို့မယ်\n"
+        "┣ 🛡️ 60s watchdog၊ auto retry နဲ့ error guidance ကို ကိုင်တွယ်မယ်\n"
+        "┗ 📣 Stage၊ retry၊ error၊ completion အခြေအနေတွေကို ဆရာ့ကို live ပြန်ပြောမယ်\n\n"
+        "ဆရာ စောင့်ရုံပါ။ Progress မရပ်သွားတာကို ကျွန်တော်က ဆက်စစ်နေပါမယ်။\n"
+        "<b>📮 Link ပုံစံ:</b> <code>http://xhslink.com/...</code>"
     )
 
 
 def new_recap_message() -> str:
     return (
-        "<b>🎬 NEW RECAP</b>\n"
-        "<i>Your next first-person Myanmar story starts here.</i>\n\n"
-        "Rednote App ထဲက <b>Share → Copy Link</b> ကိုရွေးပြီး ရလာတဲ့ link ကို "
-        "ဒီ chat ထဲမှာ ပို့လိုက်ပါ။ Script၊ narration၊ final edit နဲ့ Telegram delivery ကို "
-        "အလိုအလျောက် လုပ်ပေးပါမယ်။\n\n"
+        "<b>🕵️ DYY AGENT · NEW RECAP</b>\n"
+        "<i>ဆရာ့ရဲ့ နောက်ထပ် first-person မြန်မာဇာတ်လမ်းကို စလုပ်ကြရအောင်။</i>\n\n"
+        "ဆရာ၊ Rednote App ထဲက <b>Share → Copy Link</b> ကိုရွေးပြီး ရလာတဲ့ link ကို "
+        "ဒီ chat ထဲမှာ ပို့လိုက်ပါ။ Link ရောက်ပြီဆိုတာနဲ့ Script၊ narration၊ final edit၊ "
+        "Telegram delivery နဲ့ live monitoring ကို ဆရာ ဘာမှထပ်ပြောစရာမလိုဘဲ "
+        "ကျွန်တော်က အလိုအလျောက် လုပ်ပေးပါမယ်။\n\n"
         "<code>http://xhslink.com/...</code>"
     )
 
@@ -308,8 +301,7 @@ def help_message() -> str:
         "┣ /clonevoice — ကိုယ်ပိုင်/ခွင့်ပြုထားတဲ့ အသံကို clone လုပ်ရန်\n"
         "┣ /voicetest — ရွေးထားတဲ့ narrator နဲ့ sample နားထောင်ရန်\n"
         "┣ /voice01 — Voice-01 default clone ကို ပြန်သုံးရန်\n"
-        "┣ /usecharon — Charon Deep voice ကို ပြောင်းသုံးရန်\n"
-        "┗ /dyy — DYY monitoring reports ကို ON/OFF လုပ်ရန်\n\n"
+        "┗ /usecharon — Charon Deep voice ကို ပြောင်းသုံးရန်\n\n"
         "<b>✨ Inline buttons</b>\n"
         "Main menu က <b>Clone Voice, Voice Test, Voice Lab, New Recap</b> ခလုတ်တွေကိုလည်း "
         "တစ်ချက်နှိပ်ပြီး အသုံးပြုနိုင်ပါတယ်။\n\n"
@@ -320,6 +312,9 @@ def help_message() -> str:
         "<b>🛡️ Copyright Note</b>\n"
         "First-person recap/commentary နဲ့ source credit ထည့်ပေးပေမယ့် ၎င်းက copyright-free "
         "ဖြစ်ကြောင်း သို့မဟုတ် claim လုံးဝမဖြစ်ကြောင်း အာမမခံပါဘူး။ အသုံးပြုခွင့်ရှိတဲ့ content ကိုသာ သုံးပါ။\n\n"
+        "<b>🕵️ DYY Always-On Agent</b>\n"
+        "DYY ကို ON လုပ်စရာမလိုပါဘူး။ /start ကအစ link လက်ခံ၊ stage changes၊ retries၊ "
+        "watchdog နဲ့ completion အထိ ဆရာ့ကို context-aware live guidance ပေးနေပါမယ်။\n\n"
         "<b>💡 Progress & Retry</b>\n"
         "Job card မှာ stage တစ်ဆင့်ချင်းနဲ့ MB/segment progress ကို ပြပါတယ်။ "
         "Progress silence ၆၀ စက္ကန့်ရှိရင် watchdog စစ်ပါတယ်။ Transient error ဆို auto retry၊ "
@@ -332,8 +327,6 @@ def status_message(chat_id: int = None) -> str:
     queue_status = "🟠 Processing" if job_semaphore.locked() else "🟢 Ready"
     deepseek_status = "On" if DEEPSEEK_API_KEY else "Off"
     elevenlabs_status = "On" if ELEVENLABS_API_KEY else "Off"
-    dyy_status = is_dyy_enabled(chat_id) if chat_id is not None else DYY_AGENT_ENABLED
-    dyy_status = "On" if dyy_status else "Off"
     if not VOICE_CLONE_ENABLED:
         clone_status = "Off"
         voice_label = f"{GEMINI_TTS_VOICE} + fallback"
@@ -361,7 +354,7 @@ def status_message(chat_id: int = None) -> str:
         f"┣ <b>Script timing:</b> Video ရဲ့ {int(SCRIPT_DURATION_RATIO * 100)}% ခန့်\n"
         f"┣ <b>DeepSeek polish:</b> {deepseek_status}\n"
         f"┣ <b>ElevenLabs fallback:</b> {elevenlabs_status}\n"
-        f"┣ <b>DYY Agent:</b> {dyy_status}\n"
+        "┣ <b>DYY Agent:</b> Always On · Live\n"
         f"┣ <b>Watchdog / Retry:</b> {PROGRESS_STALL_SECONDS}s / {JOB_MAX_ATTEMPTS} attempts\n"
         f"┗ <b>Final size:</b> မူရင်းရဲ့ {int(FINAL_SIZE_RATIO * 100)}% ခန့်\n\n"
         "<i>Link တစ်ခု ပို့ပြီး Recap စတင်နိုင်ပါပြီ။</i>"
@@ -421,7 +414,6 @@ async def register_webhook(base_url: str) -> dict:
                     {"command": "voicetest", "description": "🎧 Narrator sample ကို နားထောင်မယ်"},
                     {"command": "voice01", "description": "🗣️ Voice-01 default ကို သုံးမယ်"},
                     {"command": "usecharon", "description": "🎚️ Charon Deep voice ကို သုံးမယ်"},
-                    {"command": "dyy", "description": "🕵️ DYY monitoring reports ON/OFF"},
                 ]
             },
         )
@@ -630,12 +622,10 @@ async def telegram_webhook(request: Request):
                             reply_markup=bot_menu_keyboard(),
                         )
                     )
-            elif action in {"home", "help", "status"}:
-                messages = {
-                    "home": welcome_message,
-                    "help": help_message,
-                }
-                text = status_message(chat_id) if action == "status" else messages[action]()
+            elif action == "home":
+                schedule_background(handle_dyy_start(chat_id, reply_id))
+            elif action in {"help", "status"}:
+                text = status_message(chat_id) if action == "status" else help_message()
                 schedule_background(
                     send_text(
                         chat_id,
@@ -663,8 +653,6 @@ async def telegram_webhook(request: Request):
                         reply_markup=voice_lab_keyboard(),
                     )
                 )
-            elif action == "dyy":
-                schedule_background(handle_dyy_toggle(chat_id, reply_id))
             elif action == "voice_test":
                 schedule_background(handle_voice_preview(chat_id, reply_id))
             elif action == "voice01":
@@ -684,12 +672,12 @@ async def telegram_webhook(request: Request):
         return JSONResponse({"ok": True})
 
     command = text.split(maxsplit=1)[0].split("@", 1)[0].lower()
-    if command in {"/start", "/help", "/status"}:
-        messages = {
-            "/start": welcome_message,
-            "/help": help_message,
-        }
-        text = status_message(chat_id) if command == "/status" else messages[command]()
+    if command == "/start":
+        schedule_background(handle_dyy_start(chat_id, msg_id))
+        return JSONResponse({"ok": True})
+
+    if command in {"/help", "/status"}:
+        text = status_message(chat_id) if command == "/status" else help_message()
         schedule_background(
             send_text(
                 chat_id,
@@ -729,18 +717,16 @@ async def telegram_webhook(request: Request):
         schedule_background(handle_voice_preview(chat_id, msg_id))
         return JSONResponse({"ok": True})
 
-    if command == "/dyy":
-        schedule_background(handle_dyy_toggle(chat_id, msg_id))
-        return JSONResponse({"ok": True})
-
     url_match = re.search(r"https?://[^\s，。！？,<>\"'；：）】]+", text)
     if not url_match:
         schedule_background(
             send_text(
                 chat_id,
-                "<b>📎 Rednote video link လိုပါတယ်</b>\n\n"
+                "<b>🕵️ DYY AGENT · LIVE GUIDE</b>\n"
+                "ဆရာ၊ Recap စလုပ်ဖို့ <b>Rednote video link</b> လိုပါတယ်။\n\n"
                 "Rednote App ထဲက <b>Share → Copy Link</b> နှိပ်ပြီး "
-                "ရလာတဲ့ link ကို ဒီထဲမှာ ပို့ပေးပါနော်။\n"
+                "ရလာတဲ့ link ကို ဒီထဲမှာ ပို့ပါ။ Link ရောက်ရင် ဆရာ ဘာမှထပ်ပြောစရာမလိုဘဲ "
+                "ကျွန်တော်က အလိုအလျောက် ဆက်လုပ်ပေးပါမယ်။\n"
                 "<code>http://xhslink.com/...</code>",
                 reply_to=msg_id,
                 reply_markup=bot_menu_keyboard(),
@@ -2135,23 +2121,109 @@ async def run_with_retries(operation, progress, stage: str):
     raise last_error
 
 
-def is_dyy_enabled(chat_id: int) -> bool:
-    if chat_id is None:
-        return DYY_AGENT_ENABLED
-    return dyy_preferences.get(chat_id, DYY_AGENT_ENABLED)
+def dyy_next_action(event: dict) -> str:
+    """Return event-aware next steps without calling another AI service."""
+    kind = event.get("event", "stage")
+    stage = event.get("stage", "")
+    detail = str(event.get("detail", ""))
+
+    if kind == "queued":
+        return (
+            "ဆရာ ဘာမှထပ်ပို့စရာမလိုပါဘူး။ Worker အလင်းရတာနဲ့ download ကိုစပြီး "
+            "အဆင့်တိုင်းကို ကျွန်တော်က live ဆက်ပြောပါမယ်။"
+        )
+    if kind == "retry":
+        return (
+            "Link ထပ်ပို့စရာ၊ command ထပ်ရိုက်စရာ မလိုပါဘူး။ ယာယီအခက်အခဲကို "
+            "automatic retry လုပ်ပြီး မူရင်း job ကနေတော့ ဆက်လုပ်ပါမယ်။"
+        )
+    if kind == "watchdog":
+        return (
+            "ဆရာ စောင့်နိုင်ပါတယ်။ Job task နဲ့ file-size activity ကို ဆက်စစ်နေပြီး "
+            "တကယ့် failure ဖြစ်မှသာ retry/error guidance ပေးပါမယ်။"
+        )
+    if kind == "success":
+        return (
+            "Video delivery အထိ အားလုံးပြီးပါပြီ။ နောက် Recap လိုရင် Rednote link အသစ် "
+            "တစ်ခုချင်းပို့ပါ။ DYY က အလိုအလျောက် ပြန်စပါမယ်။"
+        )
+    if kind == "fail":
+        message = detail.lower()
+        if any(marker in message for marker in ("no usable speech", "no speech", "no audio")):
+            return (
+                "ဒီ video မှာ သုံးလို့ရတဲ့ အသံတွေ့ပါဘူး။ အသံပါတဲ့ မူရင်း video link ကို "
+                "ပြန်စစ်ပြီး အဲဒီ link ကို ပို့ပါ။"
+            )
+        if "photo post" in message or "no playable video" in message:
+            return "Photo post မဟုတ်ဘဲ play လို့ရတဲ့ Rednote video link ကို ပို့ပါ။"
+        if "disk" in message or "space" in message:
+            return (
+                "Server disk နေရာလိုနေပါတယ်။ Video ပိုသေးတဲ့ link ကို စမ်းနိုင်ပြီး၊ "
+                "bot owner အနေနဲ့ server storage ကိုလည်း စစ်ရပါမယ်။"
+            )
+        if "api key" in message or "not configured" in message:
+            next_step = (
+                "ပြင်ပြီးရင် Retry Job ခလုတ်ကိုသုံးပါ။"
+                if event.get("retry_available", True)
+                else "ပြင်ပြီးရင် မူရင်း link ကို ပြန်ပို့ပါ။"
+            )
+            return (
+                "Provider configuration ပြဿနာဖြစ်နေပါတယ်။ Bot owner က API key ကို chat ထဲ "
+                f"မထည့်ဘဲ Render environment variables မှာ ပြင်ပါ။ {next_step}"
+            )
+        if any(marker in message for marker in ("private", "permission", "not found")):
+            return (
+                "Link ကို bot က access မရပါဘူး။ Public/viewable Rednote video link အသစ် "
+                "ရယူပြီး ပြန်ပို့ပါ။"
+            )
+        if event.get("retry_available", True):
+            return (
+                "ဆရာ link ထပ်ရိုက်စရာမလိုဘဲ Job card ရဲ့ <b>🔄 Retry Job</b> ခလုတ်ကိုသုံးပါ။ "
+                "မူရင်း link ကနေ ပြန်စပေးပါမယ်။"
+            )
+        return "ဒီ input ကို auto retry မလုပ်ပါဘူး။ ပြင်ပြီးတဲ့ Rednote video link အသစ်ကို ပို့ပါ။"
+
+    if kind == "complete":
+        next_steps = {
+            "download": "Video ရပြီမို့ speech analysis နဲ့ first-person script ကို အလိုအလျောက် ဆက်လုပ်ပါမယ်။",
+            "script": "Script ပြီးပါပြီ။ ရွေးထားတဲ့ narrator နဲ့ segment အလိုက် အသံသွင်းပါမယ်။",
+            "voice": "Narration ပြီးပါပြီ။ မူရင်း video နဲ့ပေါင်းပြီး target size အတိုင်း render လုပ်ပါမယ်။",
+            "render": "Final video ရပါပြီ။ Telegram limit အလိုက် ခွဲ/မခွဲ စစ်ပြီး အစဉ်လိုက် ပို့ပါမယ်။",
+            "upload": "Telegram delivery ပြီးပါပြီ။ Final completion ကို ကျွန်တော်က အတည်ပြုပါမယ်။",
+        }
+        return next_steps.get(stage, "ပြီးတဲ့အဆင့်ကို မှတ်ထားပြီး နောက်အဆင့်ကို အလိုအလျောက် ဆက်လုပ်ပါမယ်။")
+
+    stage_actions = {
+        "download": "Source ကိုရှာပြီး video ဆွဲနေပါတယ်။ Download ပြီးရင် script analysis သို့ auto ဆက်ပါမယ်။",
+        "script": "Speech နဲ့ ဇာတ်လမ်းအစ/အဆုံးကို ခွဲခြမ်းပြီး first-person မြန်မာ Recap ရေးနေပါတယ်။",
+        "voice": "Voice-01 clone ကို ဦးစားပေးပြီး မရရင် fallback အလိုအလျောက်သုံးကာ narration လုပ်နေပါတယ်။",
+        "render": "Duration မဖြတ်ဘဲ narration ပေါင်းပြီး final file size ၈၀% ခန့်သို့ encode လုပ်နေပါတယ်။",
+        "upload": "Telegram-safe MP4 parts တွေကို အစဉ်လိုက် ပို့နေပါတယ်။ Part တိုင်းပြီးတဲ့ MB ကို main card မှာ ပြပါမယ်။",
+    }
+    return stage_actions.get(
+        stage,
+        "လက်ရှိ job event ကို ကျွန်တော်က စောင့်ကြည့်နေပြီး အပြောင်းအလဲရရင် ဆရာ့ကို ဆက်ပြောပါမယ်။",
+    )
 
 
 class DYYAgent:
-    """Built-in job observer that sends detailed, respectful reports to the user."""
+    """Always-on, event-driven guide and job observer; no preference or kill switch."""
 
     def __init__(self, chat_id: int):
         self.chat_id = chat_id
 
+    async def start(self, reply_msg_id: int = None) -> None:
+        await send_text(
+            self.chat_id,
+            welcome_message(),
+            reply_to=reply_msg_id,
+            reply_markup=bot_menu_keyboard(),
+        )
+
     async def report(self, event: dict) -> None:
-        if not is_dyy_enabled(self.chat_id):
-            return
         kind = event.get("event", "stage")
         titles = {
+            "queued": "Rednote link ကို လက်ခံရရှိပါပြီ။",
             "stage": "လက်ရှိအဆင့်ကို စတင်လုပ်ဆောင်နေပါတယ်။",
             "complete": "အဆင့်တစ်ခု ပြီးစီးသွားပါပြီ။",
             "retry": "ယာယီအခက်အခဲကြောင့် automatic retry လုပ်နေပါတယ်။",
@@ -2161,15 +2233,15 @@ class DYYAgent:
         }
         title = titles.get(kind, "Job အခြေအနေကို စောင့်ကြည့်နေပါတယ်။")
         stage = event.get("stage", "")
-        stage_label = dict(JOB_STAGES).get(stage, stage or "General")
+        stage_label = dict(JOB_STAGES).get(stage, "Queue" if stage == "queue" else stage or "General")
         detail = str(event.get("detail", ""))[:320]
         lines = [
-            f"<b>🕵️ DYY AGENT</b> · <code>#{html.escape(str(event.get('job_id', '')))}</code>",
+            f"<b>🕵️ DYY AGENT · LIVE</b> · <code>#{html.escape(str(event.get('job_id', '')))}</code>",
             f"ဆရာ၊ <b>{html.escape(title)}</b>",
             "",
             f"┣ <b>Stage:</b> {html.escape(stage_label)}",
             f"┣ <b>အသေးစိတ်:</b> {html.escape(detail)}",
-            f"┗ <b>Attempt:</b> {event.get('attempt', 1)}",
+            f"┣ <b>Attempt:</b> {event.get('attempt', 1)}",
         ]
         current = event.get("current")
         total = event.get("total")
@@ -2177,38 +2249,20 @@ class DYYAgent:
             metric = format_mb(current)
             if total:
                 metric += f" / {format_mb(total)}"
-            lines.append(f"<b>Data:</b> {metric}")
+            lines.append(f"┣ <b>Data:</b> {metric}")
         if kind == "watchdog":
             lines.append(
-                f"<b>Silence:</b> {int(event.get('idle_seconds', 0))}s · "
+                f"┣ <b>Silence:</b> {int(event.get('idle_seconds', 0))}s · "
                 "task/byte activity ကို ဆက်စစ်နေပါတယ်။"
             )
-        elif kind == "fail":
-            lines.append("ဆရာ၊ Retry Job ခလုတ်ကိုသုံးပြီး မူရင်း link ကနေ ပြန်စနိုင်ပါတယ်။")
-        elif kind == "success":
-            lines.append("ဆရာ၊ delivery အထိ အားလုံးပြီးဆုံးသွားပါပြီ။")
+        lines.append(f"┗ <b>DYY လမ်းညွှန်ချက်:</b> {dyy_next_action(event)}")
+        lines.append("<i>Always On · no activation command required</i>")
         await send_text(self.chat_id, "\n".join(lines))
 
 
-async def handle_dyy_toggle(chat_id: int, reply_msg_id: int) -> None:
-    new_state = not is_dyy_enabled(chat_id)
-    dyy_preferences[chat_id] = new_state
-    if new_state:
-        message = (
-            "ဆရာ၊ <b>DYY Agent ကို ON</b> လုပ်ပြီးပါပြီ။ Stage changes၊ retries၊ "
-            "watchdog checks၊ errors နဲ့ completion reports ကို အသေးစိတ်ပြန်ပို့ပါမယ်။"
-        )
-    else:
-        message = (
-            "ဆရာ၊ <b>DYY Agent ကို OFF</b> လုပ်ပြီးပါပြီ။ Main progress card ကတော့ "
-            "ပုံမှန်အတိုင်း ဆက်ပြနေပါမယ်။"
-        )
-    await send_text(
-        chat_id,
-        f"<b>🕵️ DYY AGENT</b>\n{message}",
-        reply_to=reply_msg_id,
-        reply_markup=bot_menu_keyboard(),
-    )
+async def handle_dyy_start(chat_id: int, reply_msg_id: int = None) -> None:
+    """Start every session with DYY's always-on, actionable usage guide."""
+    await DYYAgent(chat_id).start(reply_msg_id)
 
 
 def copyright_caption(url: str, part_number: int) -> str:
@@ -2276,6 +2330,7 @@ class JobProgress:
             "total": self.total,
             "attempt": self.attempt,
             "idle_seconds": self.idle_seconds,
+            "retry_available": self.retry_available,
         }
         try:
             await self.event_callback(payload)
@@ -2938,6 +2993,11 @@ async def handle_video_job(chat_id: int, reply_msg_id: int, url: str, job_id: st
         status_id,
         job_id,
         event_callback=dyy_agent.report,
+    )
+    await progress.emit(
+        "queued",
+        detail="Rednote link accepted; DYY is monitoring the queue and worker.",
+        stage="queue",
     )
 
     async with job_semaphore:

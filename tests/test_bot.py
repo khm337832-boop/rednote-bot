@@ -540,9 +540,7 @@ class DYYAgentTests(unittest.TestCase):
             "total": 8_000_000,
             "attempt": 2,
         }
-        with patch.dict(bot.dyy_preferences, {123: True}, clear=True), patch.object(
-            bot, "send_text", side_effect=fake_send_text
-        ):
+        with patch.object(bot, "send_text", side_effect=fake_send_text):
             asyncio.run(bot.DYYAgent(123).report(event))
 
         self.assertEqual(len(sent), 1)
@@ -554,31 +552,67 @@ class DYYAgentTests(unittest.TestCase):
         self.assertIn("Data:", sent[0][1])
         self.assertIn("Attempt:</b> 2", sent[0][1])
 
-    def test_dyy_toggle_controls_reports_and_preserves_salutation(self):
+    def test_dyy_start_is_always_on_usage_guide(self):
+        update = {
+            "update_id": 990011,
+            "message": {
+                "message_id": 11,
+                "chat": {"id": 123},
+                "text": "/start",
+            },
+        }
+
+        class FakeRequest:
+            async def json(self):
+                return update
+
         sent = []
+        scheduled = []
 
         async def fake_send_text(chat_id, text, **kwargs):
-            sent.append(text)
+            sent.append((chat_id, text, kwargs))
             return 88
 
         async def run_flow():
-            agent = bot.DYYAgent(123)
-            await agent.report({"event": "stage", "detail": "hidden"})
-            await bot.handle_dyy_toggle(123, 10)
-            await agent.report({"event": "stage", "detail": "visible"})
-            await bot.handle_dyy_toggle(123, 10)
+            with patch.object(bot, "send_text", side_effect=fake_send_text), patch.object(
+                bot, "schedule_background", side_effect=lambda coroutine: scheduled.append(coroutine)
+            ):
+                await bot.telegram_webhook(FakeRequest())
+                for coroutine in scheduled:
+                    await coroutine
 
-        with patch.dict(bot.dyy_preferences, {123: False}, clear=True), patch.object(
-            bot, "send_text", side_effect=fake_send_text
-        ):
-            asyncio.run(run_flow())
-            self.assertFalse(bot.is_dyy_enabled(123))
+        asyncio.run(run_flow())
 
-        self.assertEqual(len(sent), 3)
-        self.assertIn("ON", sent[0])
-        self.assertIn("visible", sent[1])
-        self.assertIn("OFF", sent[2])
-        self.assertTrue(all("ဆရာ" in text for text in sent))
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0][0], 123)
+        self.assertIn("DYY AGENT", sent[0][1])
+        self.assertIn("ALWAYS ON", sent[0][1])
+        self.assertIn("ဆရာ အသုံးပြုရမယ့်ပုံ", sent[0][1])
+        self.assertIn("Share → Copy Link", sent[0][1])
+        self.assertNotIn("ON/OFF", sent[0][1])
+        self.assertEqual(sent[0][2]["reply_to"], 11)
+
+    def test_dyy_next_action_is_context_aware(self):
+        queued = bot.dyy_next_action({"event": "queued"})
+        no_audio = bot.dyy_next_action(
+            {"event": "fail", "detail": "No usable speech audio was found"}
+        )
+        api_key = bot.dyy_next_action(
+            {"event": "fail", "detail": "No API key was provided"}
+        )
+        retry = bot.dyy_next_action(
+            {"event": "fail", "detail": "Unknown failure", "retry_available": True}
+        )
+        permanent_config = bot.dyy_next_action(
+            {"event": "fail", "detail": "No API key", "retry_available": False}
+        )
+
+        self.assertIn("ဘာမှထပ်ပို့စရာမလို", queued)
+        self.assertIn("အသံပါတဲ့", no_audio)
+        self.assertIn("Render environment", api_key)
+        self.assertIn("Retry Job", retry)
+        self.assertIn("မူရင်း link", permanent_config)
+        self.assertNotIn("Retry Job", permanent_config)
 
     def test_progress_emits_meaningful_events_but_not_frequent_mb_updates(self):
         events = []
@@ -688,7 +722,6 @@ class BotInterfaceTests(unittest.TestCase):
             "voice01",
             "voice_test",
             "voice_lab",
-            "dyy",
             "help",
             "status",
         ):
@@ -702,7 +735,11 @@ class BotInterfaceTests(unittest.TestCase):
         self.assertIn("home", lab_callbacks)
         self.assertIn("/status", bot.help_message())
         self.assertIn("/voicetest", bot.help_message())
-        self.assertIn("/dyy", bot.help_message())
+        self.assertNotIn("/dyy", bot.help_message())
+        self.assertNotIn("dyy", callbacks)
+        self.assertIn("Always On · Live", bot.status_message(123))
+        self.assertFalse(hasattr(bot, "dyy_preferences"))
+        self.assertFalse(hasattr(bot, "DYY_AGENT_ENABLED"))
 
     def test_voice_clone_sample_detection_rejects_non_audio_documents(self):
         voice = bot.find_telegram_voice_sample(
@@ -968,7 +1005,7 @@ class HandlerFlowTests(unittest.TestCase):
                 self.assertIsNotNone(files)
             return {"ok": True, "result": {"message_id": 100}}
 
-        with patch.dict(bot.dyy_preferences, {123: True}, clear=True), patch.object(
+        with patch.object(
             bot, "download_rednote_video", side_effect=fake_download
         ), patch.object(
             bot, "run_cmd", side_effect=fake_run_cmd
@@ -991,8 +1028,10 @@ class HandlerFlowTests(unittest.TestCase):
         self.assertIn("80%", sent_videos[0]["caption"])
         self.assertIn('href="https://example.com/video"', sent_videos[0]["caption"])
         self.assertIn("မူရင်းပိုင်ဆိုင်မှုများ", sent_videos[0]["caption"])
+        self.assertTrue(any("လက်ခံရရှိ" in text for text in dyy_messages))
         self.assertTrue(any("Recap အပြည့်အစုံ" in text for text in dyy_messages))
         self.assertTrue(all("ဆရာ" in text for text in dyy_messages))
+        self.assertTrue(all("Always On" in text for text in dyy_messages))
         self.assertTrue(any("first-person" in text.lower() for text in edits))
         self.assertTrue(work_directories)
         self.assertFalse(os.path.exists(work_directories[0]))
