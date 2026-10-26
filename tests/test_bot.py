@@ -54,6 +54,127 @@ class RecapPromptTests(unittest.TestCase):
         self.assertEqual(fitted[1]["burmese"], "ဒုတိယအပိုင်း")
 
 
+class RecapProviderTests(unittest.TestCase):
+    @staticmethod
+    def fake_client(generate_content):
+        return SimpleNamespace(
+            aio=SimpleNamespace(
+                models=SimpleNamespace(generate_content=generate_content)
+            )
+        )
+
+    @staticmethod
+    def recap_response():
+        return SimpleNamespace(
+            text='[{"start":0,"end":1,"gender":"male","burmese":"ငါ ပြန်လာတယ်"}]'
+        )
+
+    def test_fast_gemini_primary_does_not_start_helpers(self):
+        calls = []
+
+        async def generate_content(model, contents, config):
+            calls.append(model)
+            return self.recap_response()
+
+        client = self.fake_client(generate_content)
+        with patch.object(bot, "GEMINI_SCRIPT_HELPER_DELAY_SECONDS", 0.05), patch.object(
+            bot, "GEMINI_SCRIPT_MAX_PARALLEL", 3
+        ), patch.object(bot, "GEMINI_SCRIPT_MODEL_TIMEOUT", 1):
+            result = asyncio.run(
+                bot.race_gemini_recap_models(
+                    client,
+                    object(),
+                    "same prompt",
+                    object(),
+                    ["primary", "helper-one", "helper-two"],
+                )
+            )
+
+        self.assertEqual(calls, ["primary"])
+        self.assertIn("ငါ ပြန်လာတယ်", result)
+
+    def test_slow_primary_gets_one_helper_and_loser_is_cancelled(self):
+        calls = []
+        starts = []
+        cancelled = []
+        prompts = []
+
+        async def generate_content(model, contents, config):
+            calls.append(model)
+            prompts.append(contents[1])
+            if model == "primary":
+                try:
+                    await asyncio.sleep(5)
+                except asyncio.CancelledError:
+                    cancelled.append(model)
+                    raise
+            await asyncio.sleep(0.01)
+            return self.recap_response()
+
+        async def on_start(model, active_requests):
+            starts.append((model, active_requests))
+
+        client = self.fake_client(generate_content)
+        with patch.object(bot, "GEMINI_SCRIPT_HELPER_DELAY_SECONDS", 0.05), patch.object(
+            bot, "GEMINI_SCRIPT_MAX_PARALLEL", 3
+        ), patch.object(bot, "GEMINI_SCRIPT_MODEL_TIMEOUT", 1):
+            result = asyncio.run(
+                bot.race_gemini_recap_models(
+                    client,
+                    object(),
+                    "same prompt",
+                    object(),
+                    ["primary", "helper-one", "helper-two"],
+                    progress_callback=on_start,
+                )
+            )
+
+        self.assertIn("ငါ ပြန်လာတယ်", result)
+        self.assertEqual(calls, ["primary", "helper-one"])
+        self.assertEqual(starts, [("primary", 1), ("helper-one", 2)])
+        self.assertEqual(cancelled, ["primary"])
+        self.assertEqual(prompts, ["same prompt", "same prompt"])
+
+    def test_malformed_fast_response_does_not_beat_valid_helper(self):
+        calls = []
+
+        async def generate_content(model, contents, config):
+            calls.append(model)
+            if model == "primary":
+                return SimpleNamespace(text="not-json")
+            return self.recap_response()
+
+        client = self.fake_client(generate_content)
+        with patch.object(bot, "GEMINI_SCRIPT_HELPER_DELAY_SECONDS", 0.05), patch.object(
+            bot, "GEMINI_SCRIPT_MAX_PARALLEL", 3
+        ), patch.object(bot, "GEMINI_SCRIPT_MODEL_TIMEOUT", 1):
+            result = asyncio.run(
+                bot.race_gemini_recap_models(
+                    client,
+                    object(),
+                    "same prompt",
+                    object(),
+                    ["primary", "helper-one"],
+                )
+            )
+
+        self.assertEqual(calls, ["primary", "helper-one"])
+        self.assertIn("ငါ ပြန်လာတယ်", result)
+
+    def test_deepseek_timeout_keeps_completed_gemini_draft(self):
+        original = [{"start": 0.0, "end": 2.0, "gender": "male", "burmese": "ငါ စခန်းဆောက်တယ်"}]
+
+        async def slow_polish(*args):
+            await asyncio.sleep(5)
+
+        with patch.object(bot, "DEEPSEEK_API_KEY", "test-only"), patch.object(
+            bot, "DEEPSEEK_POLISH_TIMEOUT", 0.05
+        ), patch.object(bot, "polish_recap_with_deepseek", side_effect=slow_polish):
+            result = asyncio.run(bot.polish_recap_with_deadline(original, 10.0))
+
+        self.assertEqual(result, original)
+
+
 class MediaSizingTests(unittest.TestCase):
     def test_encoding_bitrates_fit_target_size(self):
         target = 800 * 1024 * 1024
@@ -1038,7 +1159,10 @@ class HandlerFlowTests(unittest.TestCase):
                         pcm_file.truncate(32_000)
             return SimpleNamespace(returncode=0, stderr=b"")
 
-        async def fake_script(*args):
+        async def fake_script(*args, **kwargs):
+            callback = kwargs.get("progress_callback")
+            if callback:
+                await callback("Gemini draft · test-model · 1 active request…")
             return [{"start": 0.0, "end": 3.0, "gender": "male", "burmese": "ကျွန်တော် ပြောလိုက်တယ်"}]
 
         async def fake_synthesize(

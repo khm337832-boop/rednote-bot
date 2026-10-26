@@ -102,6 +102,10 @@ PROGRESS_STALL_SECONDS = env_int("PROGRESS_STALL_SECONDS", 60, 15)
 JOB_MAX_ATTEMPTS = env_int("JOB_MAX_ATTEMPTS", 3, 1)
 JOB_RETRY_DELAY_SECONDS = env_int("JOB_RETRY_DELAY_SECONDS", 5, 1)
 RETRY_JOB_TTL_SECONDS = env_int("RETRY_JOB_TTL_SECONDS", 86400, 60)
+GEMINI_SCRIPT_MAX_PARALLEL = min(3, env_int("GEMINI_SCRIPT_MAX_PARALLEL", 3, 1))
+GEMINI_SCRIPT_HELPER_DELAY_SECONDS = env_int("GEMINI_SCRIPT_HELPER_DELAY_SECONDS", 20, 1)
+GEMINI_SCRIPT_MODEL_TIMEOUT = env_int("GEMINI_SCRIPT_MODEL_TIMEOUT", 180, 30)
+DEEPSEEK_POLISH_TIMEOUT = env_int("DEEPSEEK_POLISH_TIMEOUT", 60, 5)
 SOURCE_CREDIT_ENABLED = os.environ.get("SOURCE_CREDIT_ENABLED", "true").strip().lower() not in {
     "0",
     "false",
@@ -129,8 +133,8 @@ def schedule_background(coroutine):
 
 
 PREFERRED_MODELS = [
-    "gemini-3.8-flash",
     "gemini-flash-latest",
+    "gemini-3.8-flash",
     "gemini-3.5-flash",
     "gemini-3.1-flash-lite-preview",
     "gemini-3.5-flash-lite",
@@ -1151,48 +1155,151 @@ async def prepare_gemini_audio(client, audio_mp3_path: str):
         raise
 
 
-async def generate_recap_response(client, audio_part, prompt: str, cfg) -> str:
-    last_err = None
-    models_to_try = list(PREFERRED_MODELS)
+async def request_gemini_recap_model(client, audio_part, prompt: str, cfg, model_name: str) -> str:
+    """Use the async SDK so slow helper requests can actually be cancelled."""
+    response = await asyncio.wait_for(
+        client.aio.models.generate_content(
+            model=model_name,
+            contents=[audio_part, prompt],
+            config=cfg,
+        ),
+        timeout=GEMINI_SCRIPT_MODEL_TIMEOUT,
+    )
+    text = str(getattr(response, "text", "") or "").strip() if response else ""
+    if not text:
+        raise ValueError("Gemini returned an empty recap")
+    payload = parse_json_payload(text)
+    items = payload.get("segments") if isinstance(payload, dict) else payload
+    if not isinstance(items, list):
+        raise ValueError("Gemini recap response is not a JSON segment array")
+    return text
 
-    for model_name in models_to_try:
-        try:
-            resp = await asyncio.to_thread(
-                client.models.generate_content,
-                model=model_name,
-                contents=[audio_part, prompt],
-                config=cfg,
+
+async def race_gemini_recap_models(
+    client,
+    audio_part,
+    prompt: str,
+    cfg,
+    model_names: list[str],
+    progress_callback=None,
+) -> str:
+    """Start helpers only for slow/failed models; first successful draft wins."""
+    candidates = list(dict.fromkeys(name for name in model_names if name))
+    if not candidates:
+        raise RuntimeError("No Gemini recap models are available")
+
+    pending = {}
+    errors = []
+    next_index = 0
+
+    async def start_next_model():
+        nonlocal next_index
+        if next_index >= len(candidates):
+            return False
+        model_name = candidates[next_index]
+        next_index += 1
+        task = asyncio.create_task(
+            request_gemini_recap_model(client, audio_part, prompt, cfg, model_name)
+        )
+        pending[task] = model_name
+        if progress_callback:
+            try:
+                await progress_callback(model_name, len(pending))
+            except Exception as exc:
+                logger.warning("Script progress update failed: %s", str(exc)[:100])
+        return True
+
+    try:
+        await start_next_model()
+        while pending:
+            done, _ = await asyncio.wait(
+                set(pending),
+                timeout=GEMINI_SCRIPT_HELPER_DELAY_SECONDS,
+                return_when=asyncio.FIRST_COMPLETED,
             )
-            if resp and resp.text:
-                logger.info("Gemini recap succeeded with model: %s", model_name)
-                return resp.text.strip()
-        except Exception as exc:
-            last_err = exc
-            logger.warning("Model %s failed: %s", model_name, str(exc)[:160])
+            if not done:
+                # Do not spend extra quota on a fast primary. A helper is added
+                # only after the configured slow-response delay.
+                if len(pending) < GEMINI_SCRIPT_MAX_PARALLEL:
+                    await start_next_model()
+                continue
+
+            successful_text = ""
+            successful_model = ""
+            failure_count = 0
+            for task in done:
+                model_name = pending.pop(task)
+                try:
+                    text = task.result()
+                    if not successful_text:
+                        successful_text = text
+                        successful_model = model_name
+                except Exception as exc:
+                    failure_count += 1
+                    errors.append(f"{model_name}: {str(exc)[:140]}")
+                    logger.warning("Model %s failed: %s", model_name, str(exc)[:160])
+
+            if successful_text:
+                logger.info("Gemini recap succeeded with model: %s", successful_model)
+                return successful_text
+
+            # Replace failures immediately; healthy in-flight requests continue.
+            for _ in range(failure_count):
+                if not await start_next_model():
+                    break
+
+    finally:
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    raise RuntimeError("; ".join(errors[-3:]) or "All Gemini recap models failed")
+
+
+async def generate_recap_response(
+    client,
+    audio_part,
+    prompt: str,
+    cfg,
+    progress_callback=None,
+) -> str:
+    last_err = None
+    try:
+        return await race_gemini_recap_models(
+            client,
+            audio_part,
+            prompt,
+            cfg,
+            list(PREFERRED_MODELS),
+            progress_callback=progress_callback,
+        )
+    except Exception as exc:
+        last_err = exc
+        logger.warning("Preferred Gemini recap models failed: %s", str(exc)[:180])
 
     # Discover an available non-TTS flash model if the preferred names change.
     try:
         available = await asyncio.to_thread(client.models.list)
+        discovered = []
         for model in available:
             model_name = getattr(model, "name", "").replace("models/", "")
             if (
                 "flash" in model_name
                 and "tts" not in model_name
                 and "image" not in model_name
-                and model_name not in models_to_try
+                and model_name not in PREFERRED_MODELS
             ):
-                try:
-                    resp = await asyncio.to_thread(
-                        client.models.generate_content,
-                        model=model_name,
-                        contents=[audio_part, prompt],
-                        config=cfg,
-                    )
-                    if resp and resp.text:
-                        logger.info("Gemini recap succeeded with discovered model: %s", model_name)
-                        return resp.text.strip()
-                except Exception as exc:
-                    last_err = exc
+                discovered.append(model_name)
+        if discovered:
+            return await race_gemini_recap_models(
+                client,
+                audio_part,
+                prompt,
+                cfg,
+                discovered,
+                progress_callback=progress_callback,
+            )
     except Exception as exc:
         last_err = exc
 
@@ -1272,8 +1379,33 @@ Input JSON:
     return segments
 
 
-async def create_recap_script_gemini(audio_mp3_path: str, total_dur: float, wav_8k: np.ndarray) -> list[dict]:
-    client = genai.Client(api_key=GEMINI_API_KEY)
+async def polish_recap_with_deadline(segments: list[dict], total_dur: float) -> list[dict]:
+    """Never let optional prose polishing hold the completed Gemini draft hostage."""
+    if not DEEPSEEK_API_KEY or not segments:
+        return segments
+    try:
+        return await asyncio.wait_for(
+            polish_recap_with_deepseek(segments, total_dur),
+            timeout=DEEPSEEK_POLISH_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "DeepSeek polish exceeded %ss; using the completed Gemini draft",
+            DEEPSEEK_POLISH_TIMEOUT,
+        )
+        return segments
+
+
+async def create_recap_script_gemini(
+    audio_mp3_path: str,
+    total_dur: float,
+    wav_8k: np.ndarray,
+    progress_callback=None,
+) -> list[dict]:
+    client = genai.Client(
+        api_key=GEMINI_API_KEY,
+        http_options={"timeout": GEMINI_SCRIPT_MODEL_TIMEOUT * 1000},
+    )
     prompt = build_recap_script_prompt(total_dur)
     cfg = types.GenerateContentConfig(
         temperature=0.25,
@@ -1281,9 +1413,24 @@ async def create_recap_script_gemini(audio_mp3_path: str, total_dur: float, wav_
     )
 
     uploaded_name = None
+
+    async def model_progress(model_name, active_requests):
+        if progress_callback:
+            await progress_callback(
+                f"Gemini draft · {model_name} · {active_requests} active request(s)…"
+            )
+
     try:
         audio_part, uploaded_name = await prepare_gemini_audio(client, audio_mp3_path)
-        raw_json_text = await generate_recap_response(client, audio_part, prompt, cfg)
+        raw_json_text = await generate_recap_response(
+            client,
+            audio_part,
+            prompt,
+            cfg,
+            progress_callback=model_progress if progress_callback else None,
+        )
+        if progress_callback:
+            await progress_callback("Gemini draft received · validating story and timestamps…")
     finally:
         if uploaded_name:
             try:
@@ -1332,7 +1479,11 @@ async def create_recap_script_gemini(audio_mp3_path: str, total_dur: float, wav_
 
     valid_segments.sort(key=lambda item: item["start"])
     valid_segments = fit_recap_narration_windows(valid_segments, total_dur)
-    return await polish_recap_with_deepseek(valid_segments, total_dur)
+    if DEEPSEEK_API_KEY and valid_segments and progress_callback:
+        await progress_callback(
+            f"Gemini draft ready · optional DeepSeek polish (max {DEEPSEEK_POLISH_TIMEOUT}s)…"
+        )
+    return await polish_recap_with_deadline(valid_segments, total_dur)
 
 
 def extract_gemini_audio_bytes(response) -> bytes:
@@ -3246,8 +3397,17 @@ async def handle_video_job(chat_id: int, reply_msg_id: int, url: str, job_id: st
                 if os.path.exists(audio_8k_pcm) and os.path.getsize(audio_8k_pcm) > 0
                 else np.zeros(8000, dtype=np.int16)
             )
+
+            async def script_progress(detail):
+                await progress.update(detail=detail, force=True)
+
             segments = await run_with_retries(
-                lambda: create_recap_script_gemini(audio_mp3, dur, wav_8k),
+                lambda: create_recap_script_gemini(
+                    audio_mp3,
+                    dur,
+                    wav_8k,
+                    progress_callback=script_progress,
+                ),
                 progress,
                 "script",
             )

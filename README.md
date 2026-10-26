@@ -28,7 +28,9 @@ Rednote (小红书) video link ကို Telegram bot ဆီ ပို့လိ�
 - Main character ကိုယ်တိုင်ပဲ ဇာတ်လမ်းတစ်ခုလုံးကို `ကျွန်တော်/ကျွန်မ/ငါ` **first-person** နဲ့ အစအဆုံး Recap ပြောပါတယ်။
 - Narration၊ နောက်ကြောင်း၊ စိတ်ထဲအသံနဲ့ အဓိကစကားတွေအကုန် first-person voice အတည်းထားပြီး third-person narrator ကို မပြောင်းပါဘူး။
 - Script narration window စုစုပေါင်းကို မူရင်း duration ရဲ့ **၈၀% ခန့်** ထိန်းပြီး၊ ပထမ ၈၀% ကိုပဲ ဖြတ်တာမဟုတ်ဘဲ ဇာတ်လမ်းအစ/အဆုံး အပြည့်အစုံကို အကျဉ်းချုပ်ပါတယ်။ ကျန် ၂၀% ကို pause/transition အဖြစ် ထားပါတယ်။
-- စာပေသံစဉ်မဟုတ်ဘဲ သဘာဝကျတဲ့ မြန်မာအပြောစကား သုံးပါတယ်။ `DEEPSEEK_API_KEY` ရှိရင် DeepSeek က script ကို timing မပြောင်းဘဲ ထပ်ဆန်းပေးနိုင်ပါတယ်။
+- Script generation မှာ Gemini primary model က စတင်ပြီး response က **20s ထက် ကြာ**သို့မဟုတ် fail ဖြစ်မှ backup helpers ကို တစ်ခုချင်း ထပ်စတင်ပါတယ်။ အများဆုံး **၃ model** က **မူရင်း prompt အတိအကျတစ်ခုထဲ** ကိုသုံးပြီး အရင်ရတဲ့ valid JSON draft ကို ယူ၊ ကျန် request တွေကို cancel လုပ်ပါတယ်။ Primary အမြန်ပြီးရင် helper လုံးဝမခေါ်ပါဘူး။
+- ဒါက API key ၃ ခု အသစ်လိုတာမဟုတ်ဘဲ Gemini API key တစ်ခုထဲက model-level helpers ဖြစ်ပါတယ်။ Slow/failed job မှာ added requests ပါသွားနိုင်တဲ့အတွက် provider quota/cost သက်ရှိနိုင်ပြီး `GEMINI_SCRIPT_MAX_PARALLEL=1` နဲ့ helpers ကို ပိတ်နိုင်ပါတယ်။
+- စာပေသံစဉ်မဟုတ်ဘဲ သဘာဝကျတဲ့ မြန်မာအပြောစကား သုံးပါတယ်။ `DEEPSEEK_API_KEY` ရှိရင် DeepSeek က script ကို timing မပြောင်းဘဲ ထပ်ဆန်းပေးနိုင်ပြီး၊ polish က default **60s** ကျော်ရင် ရပြီးသား Gemini draft ကိုပဲ ဆက်သုံးပါတယ်။
 - Default narrator အဖြစ် ရွေးထားတဲ့ **Voice-01** ရဲ့ clean reference (`audio/voice01_clone_reference.wav`) ကို ElevenLabs Instant Voice Clone နဲ့ ပထမအသုံးပြုချိန်မှာ clone လုပ်ပြီး ရလာတဲ့ voice ID ကို cache ထားပါတယ်။ Arena preview ID ကို provider API မှာ တိုက်ရိုက်သုံးတာမဟုတ်ဘဲ၊ အဲဒီ 01 အသံရဲ့ reference audio ကို cloning အတွက် သုံးတာပါ။
 - Cloned voice ရရင် အဲဒီအသံကို Recap အတွက် ဦးစားပေးသုံးပါတယ်။ Clone မရရင် **Gemini TTS `Charon`** → ElevenLabs deep male → Edge မြန်မာအသံ အစဉ်အတိုင်း fallback လုပ်ပါတယ်။
 - Voice message/audio file ကို `/clonevoice` caption နဲ့ပို့တာ (သို့) audio ကို reply လုပ်ပြီး `/clonevoice` ပို့တာနဲ့ custom clone လုပ်နိုင်ပါတယ်။ အနည်းဆုံး ၁၀ စက္ကန့်၊ အများဆုံး 20MB လက်ခံပြီး ၃ မိနစ်ထက်ကြာရင် ပထမ ၃ မိနစ်ကို သုံးပါတယ်။ အကောင်းဆုံးအတွက် တစ်ယောက်တည်း၊ music မပါတဲ့ ၁–၂ မိနစ် sample သုံးပါ။ **ကိုယ့်အသံ သို့မဟုတ် ခွင့်ပြုချက်ရထားတဲ့ အသံကိုသာ clone လုပ်ပါ။**
@@ -68,6 +70,10 @@ Repository ထဲမှာ `Dockerfile` နဲ့ `render.yaml` ပါပြီ�
 | `GEMINI_TTS_VOICE` | Default `Charon` |
 | `GEMINI_TTS_MODELS` | Default `gemini-3.8-flash-tts,gemini-2.5-flash-tts` |
 | `DEEPSEEK_MODEL` | Default `deepseek-flash` |
+| `GEMINI_SCRIPT_MAX_PARALLEL` | Default `3` (cap 3) — primary + slow-response helpers; `1` ဖြင့် sequential-only သုံးနိုင်တယ် |
+| `GEMINI_SCRIPT_HELPER_DELAY_SECONDS` | Default `20` — primary/helper response ကို စောင့်ပြီး နောက် helper တစ်ခု ထပ်စတင်ရန် |
+| `GEMINI_SCRIPT_MODEL_TIMEOUT` | Default `180` seconds — model request တစ်ခုချင်းရဲ့ timeout |
+| `DEEPSEEK_POLISH_TIMEOUT` | Default `60` seconds — optional polish ကြာရင် Gemini draft ကို ဆက်သုံးရန် |
 | `ELEVENLABS_MODEL` | Default `eleven_v4` |
 | `ELEVENLABS_VOICE_ID` | Optional — သီးသန့် ElevenLabs custom/clone voice ID; cloning enabled ဆိုရင် auto Voice-01 ထက် ဦးစားပေးတယ် (`/voice01` က chat အလိုက် override လုပ်နိုင်တယ်) |
 | `ELEVENLABS_VOICE_NAME` | Default `Adam`; voice ID မထည့်ရင် အဲဒီနာမည်နဲ့ ရှာတယ် |
@@ -101,7 +107,7 @@ Health check path က `/health` ဖြစ်ပြီး service စတင်ပ
 
 ## Tests
 
-API call မလုပ်ဘဲ script prompt၊ JSON parsing၊ PCM handling၊ voice-clone multipart/cache/provider priority၊ Telegram clone command၊ inline Voice Lab buttons၊ Voice Test audio upload၊ MB progress card၊ 60s watchdog၊ automatic/manual retry၊ DYY always-on/start guide/context-aware next steps/event isolation၊ source-credit/rights captions၊ target-size encoding correction၊ real subprocess FFmpeg-progress stream/stall cleanup နဲ့ Telegram splitting logic ကို စမ်းနိုင်ပါတယ်။
+API call မလုပ်ဘဲ script prompt၊ Gemini slow-helper race/cancellation၊ DeepSeek timeout fallback၊ JSON parsing၊ PCM handling၊ voice-clone multipart/cache/provider priority၊ Telegram clone command၊ inline Voice Lab buttons၊ Voice Test audio upload၊ MB progress card၊ 60s watchdog၊ automatic/manual retry၊ DYY always-on/start guide/context-aware next steps/event isolation၊ source-credit/rights captions၊ target-size encoding correction၊ real subprocess FFmpeg-progress stream/stall cleanup နဲ့ Telegram splitting logic ကို စမ်းနိုင်ပါတယ်။
 
 ```bash
 python -m unittest discover -s tests -v
