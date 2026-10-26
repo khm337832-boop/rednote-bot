@@ -13,7 +13,10 @@ Rednote (小红书) video link ကို Telegram bot ဆီ ပို့လိ�
 - `/usecharon` — ဒီ chat အတွက် voice clone ကို bypass လုပ်ပြီး Charon Deep voice ကို သုံးပါတယ်။
 - Main menu မှာ **New Recap, Clone Voice, Voice-01, Voice Test, Voice Lab, Help, Status** inline buttons ပါပါတယ်။
 - **Voice Lab** ထဲမှာ Clone Voice, Voice Test, Voice-01, Charon Deep, Main Menu, Status buttons ရှိပြီး active narrator ကိုပါ ပြပါတယ်။
-- Job progress ကို `DOWNLOADING → SCRIPT WRITING → VOICEOVER → RENDERING → UPLOADING` cards အဖြစ် ပြပါတယ်။
+- Job progress ကို `DOWNLOADING → SCRIPT WRITING → VOICEOVER → RENDERING → UPLOADING` structured card တစ်ခုထဲမှာ ပြပါတယ်။ Download/render မှာ **MB + progress bar**၊ voiceover မှာ segment count၊ upload မှာ part count နဲ့ delivered MB ပါပါတယ်။
+- Progress silence **၆၀ စက္ကန့်** ရှိရင် watchdog က job task/file-size activity ကို စစ်ပြီး card မှာ အသိပေးပါတယ်။ Legitimate long-running job ကို silence တစ်ခုတည်းနဲ့ ချက်ချင်း fail မလုပ်ပါဘူး။
+- Timeout/network/rate-limit အစရှိတဲ့ transient errors ကို configurable attempts နဲ့ automatic retry လုပ်ပါတယ်။ No audio/disk full/api key အစရှိတဲ့ permanent errors ကို automatic retry မလုပ်ပါဘူး။
+- Job fail ဖြစ်ရင် **🔄 Retry Job** inline button ပါပါတယ်။ Button က မူရင်း link ကနေ job အသစ် restart လုပ်ပေးပြီး၊ retry data က memory-only ဖြစ်ပြီး TTL သတ်မှတ်ထားပါတယ်။ Server restart နောက်ပိုင်း expired button ဆိုရင် link ပြန်ပို့ရပါမယ်။
 - Browser status page ကို responsive dark dashboard အဖြစ် `/` မှာ ပြထားပြီး၊ `/health` က Render health check အတွက်ပါ။
 
 ## Recap script နဲ့ အသံ
@@ -72,6 +75,12 @@ Repository ထဲမှာ `Dockerfile` နဲ့ `render.yaml` ပါပြီ�
 | `DOWNLOAD_TIMEOUT` | Default `7200` seconds |
 | `FFMPEG_TIMEOUT` | Default `7200` seconds |
 | `TELEGRAM_UPLOAD_TIMEOUT` | Default `7200` seconds |
+| `PROGRESS_EDIT_INTERVAL` | Default `3.0` seconds — Telegram progress edit throttle |
+| `PROGRESS_WATCH_INTERVAL` | Default `5` seconds — watchdog polling interval |
+| `PROGRESS_STALL_SECONDS` | Default `60` seconds — silence ဖြစ်ရင် watchdog check လုပ်ရန် |
+| `JOB_MAX_ATTEMPTS` | Default `3` — transient stage failure အတွက် စုစုပေါင်း attempts |
+| `JOB_RETRY_DELAY_SECONDS` | Default `5` — retry အကြား base delay; attempt အလိုက် တိုးတယ် |
+| `RETRY_JOB_TTL_SECONDS` | Default `86400` — memory-only manual Retry button data သက်တမ်း |
 
 > Render ရဲ့ default filesystem က ephemeral ဖြစ်လို့ redeploy/restart အလိုက် clone cache ပျောက်နိုင်ပါတယ်။ Persistent disk သုံးပြီး `VOICE_CLONE_CACHE_PATH` ကို ညှိတာ (သို့) ElevenLabs dashboard က ရထားတဲ့ cloned ID ကို `ELEVENLABS_VOICE_ID` မှာ ထည့်တာက clone အသစ်တွေ ထပ်မဆောက်မိအောင် ကူညီနိုင်ပါတယ်။
 
@@ -81,7 +90,7 @@ Health check path က `/health` ဖြစ်ပြီး service စတင်ပ
 
 ## Tests
 
-API call မလုပ်ဘဲ script prompt၊ JSON parsing၊ PCM handling၊ voice-clone multipart/cache/provider priority၊ Telegram clone command၊ inline Voice Lab buttons၊ Voice Test audio upload၊ target-size encoding correction နဲ့ Telegram splitting logic ကို စမ်းနိုင်ပါတယ်။
+API call မလုပ်ဘဲ script prompt၊ JSON parsing၊ PCM handling၊ voice-clone multipart/cache/provider priority၊ Telegram clone command၊ inline Voice Lab buttons၊ Voice Test audio upload၊ MB progress card၊ 60s watchdog၊ automatic/manual retry၊ target-size encoding correction နဲ့ Telegram splitting logic ကို စမ်းနိုင်ပါတယ်။
 
 ```bash
 python -m unittest discover -s tests -v

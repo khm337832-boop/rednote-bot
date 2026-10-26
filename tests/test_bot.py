@@ -369,6 +369,160 @@ class EncodingAndSplittingTests(unittest.TestCase):
             )
 
 
+class ProgressAndRetryTests(unittest.TestCase):
+    def test_progress_card_shows_mb_and_percentage(self):
+        progress = bot.JobProgress(123, 456, "job123")
+
+        async def fake_edit_text(*args, **kwargs):
+            return None
+
+        with patch.object(bot, "edit_text", side_effect=fake_edit_text):
+            asyncio.run(
+                progress.set_stage(
+                    "download",
+                    "Downloading test video",
+                    current=50_000_000,
+                    total=100_000_000,
+                )
+            )
+        card = progress.render()
+        self.assertIn("50.0 MB / 100.0 MB", card)
+        self.assertIn("50%", card)
+        self.assertIn("Download", card)
+        self.assertIn("60-second watchdog", card)
+
+    def test_watchdog_checks_after_sixty_seconds_without_failing_job(self):
+        progress = bot.JobProgress(123, 456, "job123")
+        progress.last_activity = bot.time.monotonic() - 61
+
+        async def fake_edit_text(*args, **kwargs):
+            return None
+
+        with patch.object(bot, "edit_text", side_effect=fake_edit_text):
+            triggered = asyncio.run(progress.check_watchdog())
+        self.assertTrue(triggered)
+        self.assertEqual(progress.watchdog_checks, 1)
+        self.assertIn("Watchdog check", progress.notice)
+        self.assertEqual(progress.error, "")
+        self.assertFalse(progress.finished)
+
+    def test_transient_stage_failure_is_retried(self):
+        progress = bot.JobProgress(123, 456, "job123")
+        attempts = []
+
+        async def operation():
+            attempts.append(len(attempts) + 1)
+            if len(attempts) == 1:
+                raise bot.RetryableJobError("network timeout")
+            return "ok"
+
+        async def fake_edit_text(*args, **kwargs):
+            return None
+
+        with patch.object(bot, "edit_text", side_effect=fake_edit_text), patch.object(
+            bot, "JOB_RETRY_DELAY_SECONDS", 0
+        ):
+            result = asyncio.run(bot.run_with_retries(operation, progress, "download"))
+        self.assertEqual(result, "ok")
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(progress.attempt, 2)
+
+    def test_permanent_stage_failure_is_not_retried(self):
+        progress = bot.JobProgress(123, 456, "job123")
+        attempts = []
+
+        async def operation():
+            attempts.append(1)
+            raise bot.PermanentJobError("No audio")
+
+        with self.assertRaises(bot.PermanentJobError):
+            asyncio.run(bot.run_with_retries(operation, progress, "script"))
+        self.assertEqual(len(attempts), 1)
+
+    def test_retry_callback_restarts_saved_job(self):
+        bot.retry_jobs["retry123"] = {
+            "chat_id": 123,
+            "reply_msg_id": 456,
+            "url": "https://example.com/video",
+            "created": bot.time.time(),
+        }
+        update = {
+            "update_id": 990010,
+            "callback_query": {
+                "id": "retry-callback",
+                "data": "retry:retry123",
+                "message": {"chat": {"id": 123}, "message_id": 999},
+            },
+        }
+
+        class FakeRequest:
+            async def json(self):
+                return update
+
+        scheduled = []
+        restarted = []
+
+        async def fake_tg_api(*args, **kwargs):
+            return {"ok": True}
+
+        async def fake_handle(chat_id, reply_id, url, job_id=None):
+            restarted.append((chat_id, reply_id, url, job_id))
+
+        async def run_flow():
+            with patch.object(bot, "tg_api", side_effect=fake_tg_api), patch.object(
+                bot, "handle_video_job", side_effect=fake_handle
+            ), patch.object(
+                bot, "schedule_background", side_effect=lambda coroutine: scheduled.append(coroutine)
+            ):
+                await bot.telegram_webhook(FakeRequest())
+                for coroutine in scheduled:
+                    await coroutine
+
+        try:
+            asyncio.run(run_flow())
+        finally:
+            bot.retry_jobs.pop("retry123", None)
+        self.assertEqual(
+            restarted,
+            [(123, 456, "https://example.com/video", "retry123")],
+        )
+    def test_failed_job_offers_manual_retry_button(self):
+        edits = []
+
+        async def fake_download(*args):
+            return False
+
+        async def fake_send_text(*args, **kwargs):
+            return 99
+
+        async def fake_edit_text(chat_id, message_id, text, reply_markup=None):
+            edits.append((text, reply_markup))
+
+        with patch.object(bot, "download_rednote_video", side_effect=fake_download), patch.object(
+            bot, "send_text", side_effect=fake_send_text
+        ), patch.object(bot, "edit_text", side_effect=fake_edit_text), patch.object(
+            bot, "JOB_MAX_ATTEMPTS", 1
+        ):
+            try:
+                asyncio.run(
+                    bot.handle_video_job(
+                        123,
+                        456,
+                        "https://example.com/video",
+                        job_id="failed123",
+                    )
+                )
+                self.assertIn("failed123", bot.retry_jobs)
+                retry_markups = [markup for _, markup in edits if markup]
+                self.assertTrue(retry_markups)
+                self.assertEqual(
+                    retry_markups[-1]["inline_keyboard"][0][0]["callback_data"],
+                    "retry:failed123",
+                )
+            finally:
+                bot.retry_jobs.pop("failed123", None)
+
+
 class BotInterfaceTests(unittest.TestCase):
     def test_menu_templates_and_keyboard(self):
         welcome = bot.welcome_message()
@@ -632,9 +786,13 @@ class HandlerFlowTests(unittest.TestCase):
         async def fake_script(*args):
             return [{"start": 0.0, "end": 3.0, "gender": "male", "burmese": "ကျွန်တော် ပြောလိုက်တယ်"}]
 
-        async def fake_synthesize(segments, duration, work_dir, output, clone_voice_id=None):
+        async def fake_synthesize(
+            segments, duration, work_dir, output, clone_voice_id=None, progress_callback=None
+        ):
             with open(output, "wb") as audio_file:
                 audio_file.write(b"dub")
+            if progress_callback:
+                await progress_callback(len(segments), len(segments), len(segments))
             return "gemini"
 
         async def fake_encode(source, output, target, duration, audio_path=None):
@@ -648,7 +806,7 @@ class HandlerFlowTests(unittest.TestCase):
         async def fake_send_text(*args, **kwargs):
             return 99
 
-        async def fake_edit_text(chat_id, message_id, text):
+        async def fake_edit_text(chat_id, message_id, text, reply_markup=None):
             edits.append(text)
 
         async def fake_tg_api(method, data=None, files=None, timeout=120.0):
@@ -676,7 +834,7 @@ class HandlerFlowTests(unittest.TestCase):
 
         self.assertEqual(len(sent_videos), 1)
         self.assertIn("80%", sent_videos[0]["caption"])
-        self.assertTrue(any("First-person" in text for text in edits))
+        self.assertTrue(any("first-person" in text.lower() for text in edits))
         self.assertTrue(work_directories)
         self.assertFalse(os.path.exists(work_directories[0]))
 
