@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: rednote-mm-bot
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: DEEPSEEK_API_KEY
+        sync: false
+      - key: ELEVENLABS_API_KEY
+        sync: false
