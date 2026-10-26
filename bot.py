@@ -5,6 +5,7 @@ import hashlib
 import html
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -106,6 +107,8 @@ GEMINI_SCRIPT_MAX_PARALLEL = min(3, env_int("GEMINI_SCRIPT_MAX_PARALLEL", 3, 1))
 GEMINI_SCRIPT_HELPER_DELAY_SECONDS = env_int("GEMINI_SCRIPT_HELPER_DELAY_SECONDS", 20, 1)
 GEMINI_SCRIPT_MODEL_TIMEOUT = env_int("GEMINI_SCRIPT_MODEL_TIMEOUT", 180, 30)
 DEEPSEEK_POLISH_TIMEOUT = env_int("DEEPSEEK_POLISH_TIMEOUT", 60, 5)
+PIPELINE_WORKERS = min(4, env_int("PIPELINE_WORKERS", 4, 1))
+RENDER_THREADS_PER_WORKER = env_int("RENDER_THREADS_PER_WORKER", 1, 1)
 SOURCE_CREDIT_ENABLED = os.environ.get("SOURCE_CREDIT_ENABLED", "true").strip().lower() not in {
     "0",
     "false",
@@ -356,6 +359,7 @@ def status_message(chat_id: int = None) -> str:
         f"{personal_voice_line}"
         f"┣ <b>Voice clone:</b> {clone_status}\n"
         f"┣ <b>Script timing:</b> Video ရဲ့ {int(SCRIPT_DURATION_RATIO * 100)}% ခန့်\n"
+        f"┣ <b>Pipeline:</b> {PIPELINE_WORKERS} worker(s) · Script/Voice/Render\n"
         f"┣ <b>DeepSeek polish:</b> {deepseek_status}\n"
         f"┣ <b>ElevenLabs fallback:</b> {elevenlabs_status}\n"
         "┣ <b>DYY Agent:</b> Always On · Live\n"
@@ -919,6 +923,34 @@ def get_media_duration(path: str) -> float:
         return 0.0
 
 
+def get_media_stream_types(path: str) -> set[str]:
+    """Return container stream kinds for final audio/video validation."""
+    proc = run_cmd(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=codec_type",
+            "-of",
+            "json",
+            path,
+        ],
+        30,
+    )
+    if proc.returncode != 0:
+        return set()
+    try:
+        payload = json.loads(proc.stdout.decode("utf-8"))
+        return {
+            str(stream.get("codec_type", ""))
+            for stream in payload.get("streams", [])
+            if stream.get("codec_type")
+        }
+    except (ValueError, AttributeError, TypeError):
+        return set()
+
+
 async def prepare_voice_clone_sample(source_path: str, out_path: str) -> float:
     """Normalize a Telegram sample to a clean mono MP3 and cap cloning cost."""
     proc = await asyncio.to_thread(
@@ -1070,14 +1102,14 @@ def fit_recap_narration_windows(
     total_dur: float,
     ratio: float = SCRIPT_DURATION_RATIO,
 ) -> list[dict]:
-    """Keep narration windows within budget while retaining full-timeline coverage."""
+    """Fit narration windows to the target budget without cutting timeline coverage."""
     if not segments or total_dur <= 0 or ratio >= 1.0:
         return segments
 
     durations = [max(0.05, float(seg["end"]) - float(seg["start"])) for seg in segments]
     allocated = sum(durations)
     target = max(0.05, total_dur * ratio)
-    if allocated <= target:
+    if allocated <= 0:
         return segments
 
     scale = target / allocated
@@ -1155,7 +1187,14 @@ async def prepare_gemini_audio(client, audio_mp3_path: str):
         raise
 
 
-async def request_gemini_recap_model(client, audio_part, prompt: str, cfg, model_name: str) -> str:
+async def request_gemini_recap_model(
+    client,
+    audio_part,
+    prompt: str,
+    cfg,
+    model_name: str,
+    require_segments: bool = True,
+) -> str:
     """Use the async SDK so slow helper requests can actually be cancelled."""
     response = await asyncio.wait_for(
         client.aio.models.generate_content(
@@ -1168,10 +1207,11 @@ async def request_gemini_recap_model(client, audio_part, prompt: str, cfg, model
     text = str(getattr(response, "text", "") or "").strip() if response else ""
     if not text:
         raise ValueError("Gemini returned an empty recap")
-    payload = parse_json_payload(text)
-    items = payload.get("segments") if isinstance(payload, dict) else payload
-    if not isinstance(items, list):
-        raise ValueError("Gemini recap response is not a JSON segment array")
+    if require_segments:
+        payload = parse_json_payload(text)
+        items = payload.get("segments") if isinstance(payload, dict) else payload
+        if not isinstance(items, list):
+            raise ValueError("Gemini recap response is not a JSON segment array")
     return text
 
 
@@ -1182,11 +1222,14 @@ async def race_gemini_recap_models(
     cfg,
     model_names: list[str],
     progress_callback=None,
+    max_parallel: int = None,
+    require_segments: bool = True,
 ) -> str:
     """Start helpers only for slow/failed models; first successful draft wins."""
     candidates = list(dict.fromkeys(name for name in model_names if name))
     if not candidates:
         raise RuntimeError("No Gemini recap models are available")
+    parallel_limit = min(3, max(1, max_parallel or GEMINI_SCRIPT_MAX_PARALLEL))
 
     pending = {}
     errors = []
@@ -1199,7 +1242,14 @@ async def race_gemini_recap_models(
         model_name = candidates[next_index]
         next_index += 1
         task = asyncio.create_task(
-            request_gemini_recap_model(client, audio_part, prompt, cfg, model_name)
+            request_gemini_recap_model(
+                client,
+                audio_part,
+                prompt,
+                cfg,
+                model_name,
+                require_segments=require_segments,
+            )
         )
         pending[task] = model_name
         if progress_callback:
@@ -1220,7 +1270,7 @@ async def race_gemini_recap_models(
             if not done:
                 # Do not spend extra quota on a fast primary. A helper is added
                 # only after the configured slow-response delay.
-                if len(pending) < GEMINI_SCRIPT_MAX_PARALLEL:
+                if len(pending) < parallel_limit:
                     await start_next_model()
                 continue
 
@@ -1263,6 +1313,8 @@ async def generate_recap_response(
     prompt: str,
     cfg,
     progress_callback=None,
+    max_parallel: int = None,
+    require_segments: bool = True,
 ) -> str:
     last_err = None
     try:
@@ -1273,6 +1325,8 @@ async def generate_recap_response(
             cfg,
             list(PREFERRED_MODELS),
             progress_callback=progress_callback,
+            max_parallel=max_parallel,
+            require_segments=require_segments,
         )
     except Exception as exc:
         last_err = exc
@@ -1299,6 +1353,8 @@ async def generate_recap_response(
                 cfg,
                 discovered,
                 progress_callback=progress_callback,
+                max_parallel=max_parallel,
+                require_segments=require_segments,
             )
     except Exception as exc:
         last_err = exc
@@ -1401,12 +1457,27 @@ async def create_recap_script_gemini(
     total_dur: float,
     wav_8k: np.ndarray,
     progress_callback=None,
+    worker_count: int = None,
+    prompt_override: str = None,
+    _worker_mode: bool = False,
+    _shared_client=None,
+    _shared_audio_part=None,
 ) -> list[dict]:
-    client = genai.Client(
+    workers = PIPELINE_WORKERS if worker_count is None else max(1, min(4, worker_count))
+    if workers > 1 and not _worker_mode:
+        return await create_recap_script_parallel(
+            audio_mp3_path,
+            total_dur,
+            wav_8k,
+            workers,
+            progress_callback=progress_callback,
+        )
+
+    client = _shared_client or genai.Client(
         api_key=GEMINI_API_KEY,
         http_options={"timeout": GEMINI_SCRIPT_MODEL_TIMEOUT * 1000},
     )
-    prompt = build_recap_script_prompt(total_dur)
+    prompt = prompt_override or build_recap_script_prompt(total_dur)
     cfg = types.GenerateContentConfig(
         temperature=0.25,
         response_mime_type="application/json",
@@ -1421,13 +1492,17 @@ async def create_recap_script_gemini(
             )
 
     try:
-        audio_part, uploaded_name = await prepare_gemini_audio(client, audio_mp3_path)
+        if _shared_audio_part is not None:
+            audio_part = _shared_audio_part
+        else:
+            audio_part, uploaded_name = await prepare_gemini_audio(client, audio_mp3_path)
         raw_json_text = await generate_recap_response(
             client,
             audio_part,
             prompt,
             cfg,
             progress_callback=model_progress if progress_callback else None,
+            max_parallel=1 if _worker_mode else None,
         )
         if progress_callback:
             await progress_callback("Gemini draft received · validating story and timestamps…")
@@ -1478,12 +1553,237 @@ async def create_recap_script_gemini(
             logger.warning("Skipping malformed segment %s: %s", seg, exc)
 
     valid_segments.sort(key=lambda item: item["start"])
-    valid_segments = fit_recap_narration_windows(valid_segments, total_dur)
+    if not _worker_mode:
+        valid_segments = fit_recap_narration_windows(valid_segments, total_dur)
     if DEEPSEEK_API_KEY and valid_segments and progress_callback:
         await progress_callback(
             f"Gemini draft ready · optional DeepSeek polish (max {DEEPSEEK_POLISH_TIMEOUT}s)…"
         )
     return await polish_recap_with_deadline(valid_segments, total_dur)
+
+
+def divide_timeline_ranges(total_dur: float, worker_count: int = None) -> list[dict]:
+    """Split a timeline into ordered, non-overlapping ranges with no gaps."""
+    duration = float(total_dur)
+    if not math.isfinite(duration) or duration <= 0:
+        raise ValueError("Timeline duration must be positive")
+    requested = PIPELINE_WORKERS if worker_count is None else int(worker_count)
+    workers = max(1, min(4, requested))
+    # Avoid zero-length FFmpeg/model assignments for exceptionally short media.
+    workers = min(workers, max(1, int(math.ceil(duration / 0.25))))
+    ranges = []
+    for index in range(workers):
+        start = duration * index / workers
+        end = duration * (index + 1) / workers
+        ranges.append({"index": index, "start": start, "end": end})
+    return ranges
+
+
+def narration_window_coverage(segments: list[dict], total_dur: float) -> float:
+    if total_dur <= 0:
+        return 0.0
+    allocated = sum(max(0.0, float(seg["end"]) - float(seg["start"])) for seg in segments)
+    return allocated / float(total_dur)
+
+
+def normalize_worker_segments(
+    segments: list[dict],
+    range_start: float,
+    range_end: float,
+) -> list[dict]:
+    """Constrain a worker's draft to its assignment while retaining story order."""
+    normalized = []
+    for segment in sorted(segments, key=lambda item: float(item["start"])):
+        start = max(range_start, float(segment["start"]))
+        end = min(range_end, float(segment["end"]))
+        if end <= start:
+            continue
+        normalized.append({**segment, "start": start, "end": end})
+    return normalized
+
+
+def build_script_worker_prompt(
+    total_dur: float,
+    story_map: str,
+    timeline_range: dict,
+    worker_count: int,
+) -> str:
+    index = timeline_range["index"]
+    start = timeline_range["start"]
+    end = timeline_range["end"]
+    range_budget = (end - start) * SCRIPT_DURATION_RATIO
+    return build_recap_script_prompt(total_dur) + "\n\n" + f"""
+
+SHARED STORY MAP FROM THE LEAD EDITOR:
+{story_map[:30_000]}
+
+SCRIPT WORKER ASSIGNMENT (these rules override general full-script timing rules):
+- You are worker {index + 1} of {worker_count}. Your exclusive source range is
+  {start:.3f} to {end:.3f} seconds. Cover EVERY important event, revelation,
+  inner thought and key dialogue in this range; do not stop early.
+- Return blocks only for your assigned range. Every start/end must be inside
+  {start:.3f} to {end:.3f}. Do not repeat another worker's range.
+- Use the shared map to preserve names, cause/effect, chronology and the same
+  main protagonist's first-person voice across all workers. Never introduce an
+  outside narrator and never invent facts that are not supported by the audio.
+- Your share of the narration budget is about {range_budget:.1f} seconds,
+  approximately {int(SCRIPT_DURATION_RATIO * 100)}% of this assigned range.
+- Worker 1 supplies the gripping opening; the final worker supplies the complete
+  ending. Middle workers must begin and end with natural transitions, not greetings.
+- Return ONLY the JSON array for this assigned range.
+""".strip()
+
+
+async def create_recap_script_parallel(
+    audio_mp3_path: str,
+    total_dur: float,
+    wav_8k: np.ndarray,
+    worker_count: int,
+    progress_callback=None,
+) -> list[dict]:
+    """Plan once, write ordered ranges concurrently, then validate one locked script."""
+    ranges = divide_timeline_ranges(total_dur, worker_count)
+    client = genai.Client(
+        api_key=GEMINI_API_KEY,
+        http_options={"timeout": GEMINI_SCRIPT_MODEL_TIMEOUT * 1000},
+    )
+    uploaded_name = None
+
+    async def report(text):
+        if progress_callback:
+            await progress_callback(text)
+
+    try:
+        audio_part, uploaded_name = await prepare_gemini_audio(client, audio_mp3_path)
+        await report(f"Shared story map · full {total_dur:.1f}s timeline · 1 lead editor…")
+        story_map_prompt = build_recap_script_prompt(total_dur) + "\n\n" + """
+
+STORY-MAP PASS OVERRIDE:
+For this planning pass only, ignore the JSON output schema above. Listen to the
+ENTIRE audio and write a detailed plain-text Myanmar story map for four script
+workers. Identify the main protagonist and consistent first-person pronoun, all
+important characters, background, conflicts, turning points, discoveries, key
+dialogue, chronology and the complete ending. Include approximate source times
+so workers can align their assignments. Do not write a final recap, greetings,
+production notes, Markdown fences or JSON. Preserve every supported fact and do
+not invent anything. The map must cover the whole timeline, not just the opening.
+""".strip()
+
+        async def map_progress(model_name, active_requests):
+            await report(
+                f"Shared story map · {model_name} · {active_requests} active request(s)…"
+            )
+
+        try:
+            story_map = await generate_recap_response(
+                client,
+                audio_part,
+                story_map_prompt,
+                types.GenerateContentConfig(temperature=0.2),
+                progress_callback=map_progress,
+                require_segments=False,
+            )
+            if not story_map.strip():
+                raise ValueError("Gemini returned an empty story map")
+        except Exception as exc:
+            logger.warning("Parallel story map failed; using one-pass script: %s", str(exc)[:180])
+            await report("Story map unavailable · safe one-pass Script fallback…")
+            return await create_recap_script_gemini(
+                audio_mp3_path,
+                total_dur,
+                wav_8k,
+                progress_callback=progress_callback,
+                worker_count=1,
+                _shared_client=client,
+                _shared_audio_part=audio_part,
+            )
+
+        await report(
+            f"Story map locked · {len(ranges)} Script workers · "
+            + " / ".join(f"W{item['index'] + 1} {item['start']:.1f}–{item['end']:.1f}s" for item in ranges)
+        )
+        completed = set()
+
+        async def run_worker(timeline_range):
+            index = timeline_range["index"]
+            prompt = build_script_worker_prompt(total_dur, story_map, timeline_range, len(ranges))
+            last_error = None
+
+            async def worker_progress(text):
+                await report(
+                    f"Script workers · {len(completed)}/{len(ranges)} complete · "
+                    f"W{index + 1} {timeline_range['start']:.1f}–{timeline_range['end']:.1f}s · {text}"
+                )
+
+            for attempt in range(1, 3):
+                try:
+                    await worker_progress(f"draft/polish attempt {attempt}/2…")
+                    draft = await create_recap_script_gemini(
+                        audio_mp3_path,
+                        total_dur,
+                        wav_8k,
+                        progress_callback=worker_progress,
+                        worker_count=1,
+                        prompt_override=(prompt if attempt == 1 else prompt + "\nCORRECTION: Your previous answer did not cover the assigned range with valid ordered blocks. Complete the full assignment now."),
+                        _worker_mode=True,
+                        _shared_client=client,
+                        _shared_audio_part=audio_part,
+                    )
+                    normalized = normalize_worker_segments(
+                        draft,
+                        timeline_range["start"],
+                        timeline_range["end"],
+                    )
+                    if not normalized:
+                        raise ValueError("worker returned no usable blocks inside its assigned range")
+                    completed.add(index)
+                    await worker_progress(f"locked · {len(normalized)} ordered block(s)")
+                    return normalized
+                except Exception as exc:
+                    last_error = exc
+                    logger.warning(
+                        "Script worker %s attempt %s failed: %s",
+                        index + 1,
+                        attempt,
+                        str(exc)[:160],
+                    )
+                    if attempt == 1:
+                        await worker_progress("invalid/incomplete range · one corrective retry…")
+            raise last_error
+
+        results = await asyncio.gather(
+            *(run_worker(timeline_range) for timeline_range in ranges),
+            return_exceptions=True,
+        )
+        failures = [result for result in results if isinstance(result, Exception)]
+        if failures:
+            logger.warning("Script worker pipeline incomplete: %s", str(failures[0])[:180])
+            await report("A Script range stayed incomplete · safe one-pass full-story fallback…")
+            return await create_recap_script_gemini(
+                audio_mp3_path,
+                total_dur,
+                wav_8k,
+                progress_callback=progress_callback,
+                worker_count=1,
+                _shared_client=client,
+                _shared_audio_part=audio_part,
+            )
+
+        merged = [segment for worker_segments in results for segment in worker_segments]
+        merged.sort(key=lambda item: item["start"])
+        merged = fit_recap_narration_windows(merged, total_dur)
+        coverage = narration_window_coverage(merged, total_dur)
+        await report(
+            f"Script locked · {len(ranges)}/{len(ranges)} workers merged · "
+            f"{len(merged)} ordered blocks · {coverage:.0%} narration window"
+        )
+        return merged
+    finally:
+        if uploaded_name:
+            try:
+                await asyncio.to_thread(client.files.delete, name=uploaded_name)
+            except Exception as exc:
+                logger.warning("Could not delete temporary Gemini upload: %s", str(exc)[:120])
 
 
 def extract_gemini_audio_bytes(response) -> bytes:
@@ -1869,12 +2169,14 @@ async def synthesize_narration(
     elevenlabs_voice_id: str = None,
 ):
     default_order = ["gemini", "elevenlabs", "edge"]
-    if preferred_provider in default_order:
-        default_order.remove(preferred_provider)
-        default_order.insert(0, preferred_provider)
     if TTS_PROVIDER in default_order:
         default_order.remove(TTS_PROVIDER)
         default_order.insert(0, TTS_PROVIDER)
+    # An explicit selection is a voice lock, not merely a suggestion. It must
+    # override the process default so fallback/provider changes stay consistent.
+    if preferred_provider in default_order:
+        default_order.remove(preferred_provider)
+        default_order.insert(0, preferred_provider)
 
     errors = []
     for provider in default_order:
@@ -1905,7 +2207,7 @@ async def synthesize_narration(
     raise RuntimeError("All TTS providers failed; " + "; ".join(errors))
 
 
-async def synthesize_dubbed_track(
+async def synthesize_dubbed_track_sequential(
     segments: list[dict],
     total_dur: float,
     work_dir: str,
@@ -2115,6 +2417,315 @@ async def synthesize_dubbed_track(
         raise RuntimeError("Could not create the final narration track")
     logger.info("Narration completed with %s using %s segments", selected_provider, synthesized_count)
     return selected_provider or "edge"
+
+
+async def prepare_narration_segment(
+    segment: dict,
+    index: int,
+    work_dir: str,
+    preferred_provider: str,
+    elevenlabs_voice_id: str,
+) -> dict:
+    """Synthesize and trim one segment; ordered PCM mixing happens separately."""
+    raw_tts_path = None
+    trimmed_wav = os.path.join(work_dir, f"seg_{index}_trim.wav")
+    try:
+        raw_tts_path, actual_provider, resolved_voice = await synthesize_narration(
+            segment["burmese"],
+            work_dir,
+            index,
+            preferred_provider,
+            elevenlabs_voice_id,
+        )
+        trim_filter = (
+            "silenceremove=start_periods=1:start_silence=0.04:start_threshold=-45dB,"
+            "areverse,"
+            "silenceremove=start_periods=1:start_silence=0.06:start_threshold=-45dB,"
+            "areverse"
+        )
+        await asyncio.to_thread(
+            run_cmd,
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                raw_tts_path,
+                "-af",
+                trim_filter,
+                "-ac",
+                "1",
+                "-ar",
+                str(SAMPLE_RATE),
+                trimmed_wav,
+            ],
+            90,
+        )
+        if not os.path.exists(trimmed_wav) or os.path.getsize(trimmed_wav) < 200:
+            await asyncio.to_thread(
+                run_cmd,
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-i",
+                    raw_tts_path,
+                    "-ac",
+                    "1",
+                    "-ar",
+                    str(SAMPLE_RATE),
+                    trimmed_wav,
+                ],
+                90,
+            )
+        tts_dur = await asyncio.to_thread(get_media_duration, trimmed_wav)
+        if tts_dur <= 0.05:
+            raise RuntimeError("synthesized narration is empty")
+        return {
+            "index": index,
+            "trimmed_wav": trimmed_wav,
+            "duration": tts_dur,
+            "provider": actual_provider,
+            "voice_id": resolved_voice,
+        }
+    except Exception:
+        try:
+            os.remove(trimmed_wav)
+        except OSError:
+            pass
+        raise
+    finally:
+        if raw_tts_path:
+            try:
+                os.remove(raw_tts_path)
+            except OSError:
+                pass
+
+
+async def synthesize_dubbed_track_parallel(
+    segments: list[dict],
+    total_dur: float,
+    work_dir: str,
+    out_audio_path: str,
+    clone_voice_id: str = None,
+    progress_callback=None,
+    worker_count: int = 4,
+) -> str:
+    """Prepare bounded groups concurrently, then mix every group in script order."""
+    if not segments:
+        raise RuntimeError("No narration segments could be synthesized")
+    workers = max(1, min(4, int(worker_count)))
+    total_samples = int(np.ceil((total_dur + 2.0) * SAMPLE_RATE))
+    raw_master_path = os.path.join(work_dir, "master_float.pcm")
+    master_s16_path = os.path.join(work_dir, "master_s16.pcm")
+    master_pcm = np.memmap(
+        raw_master_path,
+        dtype=np.float32,
+        mode="w+",
+        shape=(total_samples,),
+    )
+    init_chunk = SAMPLE_RATE * 60
+    for offset in range(0, total_samples, init_chunk):
+        master_pcm[offset : offset + init_chunk] = 0.0
+
+    cursor_sample = 0
+    synthesized_count = 0
+    processed_count = 0
+    selected_provider = "elevenlabs" if clone_voice_id else None
+    selected_eleven_voice = clone_voice_id or None
+
+    async def report_progress():
+        if progress_callback:
+            try:
+                await progress_callback(processed_count, len(segments), synthesized_count)
+            except Exception as callback_error:
+                logger.warning("Voice progress callback failed: %s", str(callback_error)[:100])
+
+    async def prepare_and_report(index: int):
+        nonlocal processed_count
+        try:
+            return await prepare_narration_segment(
+                segments[index],
+                index,
+                work_dir,
+                selected_provider,
+                selected_eleven_voice,
+            )
+        except Exception as exc:
+            logger.warning("Voice worker could not prepare segment %s: %s", index, str(exc)[:180])
+            return exc
+        finally:
+            processed_count += 1
+            await report_progress()
+
+    async def mix_prepared(prepared):
+        nonlocal master_pcm, cursor_sample, synthesized_count
+        nonlocal selected_provider, selected_eleven_voice
+        if isinstance(prepared, Exception):
+            return
+        index = prepared["index"]
+        segment = segments[index]
+        trimmed_wav = prepared["trimmed_wav"]
+        final_pcm_path = os.path.join(work_dir, f"seg_{index}.pcm")
+        try:
+            start_sec = max(segment["start"], cursor_sample / SAMPLE_RATE)
+            segment_end = float(segment.get("end", total_dur))
+            if index + 1 < len(segments):
+                next_start = max(start_sec + 0.4, segments[index + 1]["start"])
+                window_end = min(next_start, segment_end)
+                avail_dur = max(0.35, window_end - start_sec - 0.03)
+            else:
+                avail_dur = max(0.35, segment_end - start_sec)
+
+            speed_ratio = prepared["duration"] / avail_dur if avail_dur > 0 else 1.0
+            ff_cmd = ["ffmpeg", "-y", "-i", trimmed_wav]
+            if speed_ratio > 1.03:
+                ff_cmd += ["-af", f"atempo={min(1.45, speed_ratio):.3f}"]
+            ff_cmd += [
+                "-f",
+                "s16le",
+                "-acodec",
+                "pcm_s16le",
+                "-ac",
+                "1",
+                "-ar",
+                str(SAMPLE_RATE),
+                final_pcm_path,
+            ]
+            await asyncio.to_thread(run_cmd, ff_cmd, 90)
+            if not os.path.exists(final_pcm_path):
+                return
+            seg_pcm = np.fromfile(final_pcm_path, dtype=np.int16).astype(np.float32) / 32768.0
+            if len(seg_pcm) == 0:
+                return
+
+            fade_len = min(int(0.015 * SAMPLE_RATE), len(seg_pcm) // 4)
+            if fade_len > 1:
+                seg_pcm[:fade_len] *= np.linspace(0.0, 1.0, fade_len, dtype=np.float32)
+                seg_pcm[-fade_len:] *= np.linspace(1.0, 0.0, fade_len, dtype=np.float32)
+
+            place_idx = max(0, int(start_sec * SAMPLE_RATE))
+            if place_idx >= total_samples:
+                return
+            end_idx = min(place_idx + len(seg_pcm), total_samples)
+            seg_pcm = seg_pcm[: end_idx - place_idx]
+            master_pcm[place_idx:end_idx] += seg_pcm
+            cursor_sample = min(total_samples, end_idx + int(0.05 * SAMPLE_RATE))
+            synthesized_count += 1
+            selected_provider = prepared["provider"]
+            selected_eleven_voice = prepared["voice_id"]
+        except Exception as exc:
+            logger.warning("Skipping ordered TTS mix for segment %s: %s", index, str(exc)[:180])
+        finally:
+            for temporary_path in (trimmed_wav, final_pcm_path):
+                try:
+                    os.remove(temporary_path)
+                except OSError:
+                    pass
+            await report_progress()
+
+    # The first completed segment locks Voice-01/provider selection for every worker.
+    first_result = await prepare_and_report(0)
+    await mix_prepared(first_result)
+    for batch_start in range(1, len(segments), workers):
+        batch_indexes = range(batch_start, min(batch_start + workers, len(segments)))
+        prepared_batch = await asyncio.gather(
+            *(prepare_and_report(index) for index in batch_indexes)
+        )
+        for prepared in prepared_batch:
+            await mix_prepared(prepared)
+
+    if synthesized_count == 0:
+        del master_pcm
+        raise RuntimeError("No narration segments could be synthesized")
+
+    target_len = min(int(total_dur * SAMPLE_RATE), total_samples)
+    if cursor_sample > target_len:
+        target_len = min(cursor_sample, int((total_dur + 1.2) * SAMPLE_RATE), total_samples)
+
+    peak = 0.0
+    io_chunk = SAMPLE_RATE * 60
+    for offset in range(0, target_len, io_chunk):
+        chunk = master_pcm[offset : min(offset + io_chunk, target_len)]
+        if len(chunk):
+            peak = max(peak, float(np.max(np.abs(chunk))))
+
+    gain = 0.92 / peak if peak > 0.01 else 1.0
+    with open(master_s16_path, "wb") as output_file:
+        for offset in range(0, target_len, io_chunk):
+            chunk = master_pcm[offset : min(offset + io_chunk, target_len)]
+            pcm_s16 = np.clip(chunk * gain * 32767.0, -32768, 32767).astype(np.int16)
+            pcm_s16.tofile(output_file)
+
+    master_pcm.flush()
+    del master_pcm
+    try:
+        os.remove(raw_master_path)
+    except OSError:
+        pass
+
+    await asyncio.to_thread(
+        run_cmd,
+        [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "s16le",
+            "-ar",
+            str(SAMPLE_RATE),
+            "-ac",
+            "1",
+            "-i",
+            master_s16_path,
+            "-c:a",
+            "libmp3lame",
+            "-b:a",
+            "96k",
+            out_audio_path,
+        ],
+        FFMPEG_TIMEOUT,
+    )
+    try:
+        os.remove(master_s16_path)
+    except OSError:
+        pass
+
+    if not os.path.exists(out_audio_path) or os.path.getsize(out_audio_path) < 200:
+        raise RuntimeError("Could not create the final narration track")
+    logger.info(
+        "Parallel narration completed with %s using %s segments and %s workers",
+        selected_provider,
+        synthesized_count,
+        workers,
+    )
+    return selected_provider or "edge"
+
+
+async def synthesize_dubbed_track(
+    segments: list[dict],
+    total_dur: float,
+    work_dir: str,
+    out_audio_path: str,
+    clone_voice_id: str = None,
+    progress_callback=None,
+):
+    """Use the configured bounded worker count, with the original sequential fallback."""
+    if PIPELINE_WORKERS <= 1:
+        return await synthesize_dubbed_track_sequential(
+            segments,
+            total_dur,
+            work_dir,
+            out_audio_path,
+            clone_voice_id,
+            progress_callback,
+        )
+    return await synthesize_dubbed_track_parallel(
+        segments,
+        total_dur,
+        work_dir,
+        out_audio_path,
+        clone_voice_id,
+        progress_callback,
+        worker_count=PIPELINE_WORKERS,
+    )
 
 
 def human_file_size(size_bytes: int) -> str:
@@ -2832,7 +3443,7 @@ async def run_ffmpeg_with_progress(cmd: list[str], timeout: int, progress_callba
         await asyncio.gather(*cleanup_tasks, return_exceptions=True)
 
 
-async def encode_video_to_target_size(
+async def encode_video_to_target_size_sequential(
     input_path: str,
     output_path: str,
     target_bytes: int,
@@ -2909,7 +3520,7 @@ async def encode_video_to_target_size(
             "+faststart",
             attempt_path,
         ]
-        async def report_attempt_progress(stats):
+        async def report_attempt_progress(stats, attempt=attempt):
             if progress_callback:
                 await progress_callback(stats, attempt + 1)
 
@@ -2965,6 +3576,376 @@ async def encode_video_to_target_size(
         human_file_size(best_size),
     )
     return best_size
+
+
+async def encode_video_to_target_size_parallel(
+    input_path: str,
+    output_path: str,
+    target_bytes: int,
+    duration: float,
+    audio_path: str = None,
+    progress_callback=None,
+    worker_count: int = 4,
+) -> int:
+    """Encode ordered timeline parts with common settings, join, and validate."""
+    base_video_bps, audio_bps = calculate_encoding_bitrates(target_bytes, duration)
+    video_bps = base_video_bps
+    ranges = divide_timeline_ranges(duration, worker_count)
+    workers = len(ranges)
+    threads = RENDER_THREADS_PER_WORKER
+    output_base = os.path.splitext(output_path)[0]
+    best_path = None
+    best_difference = None
+    best_size = 0
+    last_error = None
+
+    def remove_files(paths):
+        for path in paths:
+            if not path:
+                continue
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    for attempt in range(2):
+        part_paths = [
+            f"{output_base}.part{item['index']}.attempt{attempt}.mp4" for item in ranges
+        ]
+        concat_path = f"{output_base}.attempt{attempt}.concat.txt"
+        joined_path = f"{output_base}.joined.attempt{attempt}.mp4"
+        part_stats = {item["index"]: {} for item in ranges}
+        completed_parts = set()
+
+        async def report_aggregate(
+            stats=None,
+            joining=False,
+            validated=False,
+            part_stats=part_stats,
+            completed_parts=completed_parts,
+            attempt=attempt,
+        ):
+            if not progress_callback:
+                return
+            if stats is not None:
+                aggregate = dict(stats)
+            else:
+                encoded_seconds = 0.0
+                total_size = 0
+                speeds = []
+                for item in ranges:
+                    current = part_stats[item["index"]]
+                    try:
+                        part_seconds = float(current.get("out_time_ms", 0)) / 1_000_000
+                    except (TypeError, ValueError):
+                        part_seconds = 0.0
+                    encoded_seconds += min(
+                        item["end"] - item["start"],
+                        max(0.0, part_seconds),
+                    )
+                    try:
+                        total_size += max(0, int(current.get("total_size", 0)))
+                    except (TypeError, ValueError):
+                        pass
+                    try:
+                        speeds.append(float(str(current.get("speed", "")).rstrip("x")))
+                    except (TypeError, ValueError):
+                        pass
+                aggregate = {
+                    "out_time_ms": str(int(encoded_seconds * 1_000_000)),
+                    "total_size": str(total_size),
+                    "speed": f"{sum(speeds):.2f}x" if speeds else "N/A",
+                }
+            aggregate["pipeline_parts"] = str(workers)
+            aggregate["parts_complete"] = str(len(completed_parts))
+            if joining:
+                aggregate["joining"] = "1"
+            if validated:
+                aggregate["validated"] = "1"
+            await progress_callback(aggregate, attempt + 1)
+
+        async def render_part(
+            timeline_range,
+            part_path,
+            video_bps=video_bps,
+            part_stats=part_stats,
+            completed_parts=completed_parts,
+            report_aggregate=report_aggregate,
+        ):
+            index = timeline_range["index"]
+            start = timeline_range["start"]
+            part_duration = timeline_range["end"] - start
+            if video_bps < 300_000:
+                max_width = 640
+            elif video_bps < 700_000:
+                max_width = 854
+            elif video_bps < 1_500_000:
+                max_width = 1280
+            else:
+                max_width = 1920
+
+            cmd = [
+                "ffmpeg",
+                "-hide_banner",
+                "-nostats",
+                "-loglevel",
+                "warning",
+                "-progress",
+                "pipe:1",
+                "-y",
+                "-ss",
+                f"{start:.3f}",
+                "-i",
+                input_path,
+            ]
+            if audio_path:
+                cmd += ["-ss", f"{start:.3f}", "-i", audio_path]
+            cmd += ["-map", "0:v:0", "-map", "1:a:0" if audio_path else "0:a:0?"]
+            cmd += [
+                "-t",
+                f"{part_duration:.3f}",
+                "-vf",
+                f"scale='min({max_width},iw)':-2",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-threads",
+                str(threads),
+                "-b:v",
+                str(video_bps),
+                "-maxrate",
+                str(int(video_bps * 1.12)),
+                "-bufsize",
+                str(video_bps * 2),
+                "-g",
+                "48",
+                "-keyint_min",
+                "48",
+                "-sc_threshold",
+                "0",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-b:a",
+                str(audio_bps),
+                "-ac",
+                "1",
+                "-max_muxing_queue_size",
+                "1024",
+                "-movflags",
+                "+faststart",
+                part_path,
+            ]
+
+            async def report_part_progress(
+                stats,
+                index=index,
+                part_stats=part_stats,
+                report_aggregate=report_aggregate,
+            ):
+                part_stats[index] = dict(stats)
+                await report_aggregate()
+
+            proc = await run_ffmpeg_with_progress(
+                cmd,
+                FFMPEG_TIMEOUT,
+                progress_callback=report_part_progress,
+            )
+            if proc.returncode != 0:
+                raise RetryableJobError(
+                    f"Render part {index + 1} failed: "
+                    + proc.stderr.decode(errors="ignore")[-180:]
+                )
+            if not os.path.exists(part_path) or os.path.getsize(part_path) < 1000:
+                raise RetryableJobError(f"Render part {index + 1} is empty")
+
+            actual_duration, stream_types = await asyncio.gather(
+                asyncio.to_thread(get_media_duration, part_path),
+                asyncio.to_thread(get_media_stream_types, part_path),
+            )
+            if actual_duration < max(0.2, part_duration * 0.90):
+                raise RetryableJobError(f"Render part {index + 1} is incomplete")
+            if actual_duration > part_duration * 1.10 + 0.5:
+                raise RetryableJobError(f"Render part {index + 1} exceeds its timeline range")
+            if not {"video", "audio"}.issubset(stream_types):
+                raise RetryableJobError(f"Render part {index + 1} is missing audio/video")
+
+            completed_parts.add(index)
+            part_stats[index] = {
+                **part_stats[index],
+                "out_time_ms": str(int(part_duration * 1_000_000)),
+                "total_size": str(os.path.getsize(part_path)),
+            }
+            await report_aggregate()
+            return part_path
+
+        try:
+            results = await asyncio.gather(
+                *(
+                    render_part(timeline_range, part_path)
+                    for timeline_range, part_path in zip(ranges, part_paths)
+                ),
+                return_exceptions=True,
+            )
+            failures = [result for result in results if isinstance(result, Exception)]
+            if failures:
+                raise RuntimeError(f"Parallel render parts failed: {failures[0]}") from failures[0]
+
+            with open(concat_path, "w", encoding="utf-8") as concat_file:
+                for part_path in part_paths:
+                    escaped_path = os.path.abspath(part_path).replace("'", "'\\''")
+                    concat_file.write(f"file '{escaped_path}'\n")
+
+            await report_aggregate(joining=True)
+            join_cmd = [
+                "ffmpeg",
+                "-hide_banner",
+                "-nostats",
+                "-loglevel",
+                "warning",
+                "-progress",
+                "pipe:1",
+                "-y",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                concat_path,
+                "-map",
+                "0:v:0",
+                "-map",
+                "0:a:0",
+                "-c",
+                "copy",
+                "-movflags",
+                "+faststart",
+                joined_path,
+            ]
+
+            async def report_join_progress(stats, report_aggregate=report_aggregate):
+                await report_aggregate(stats=stats, joining=True)
+
+            join_proc = await run_ffmpeg_with_progress(
+                join_cmd,
+                FFMPEG_TIMEOUT,
+                progress_callback=report_join_progress,
+            )
+            if join_proc.returncode != 0:
+                raise RetryableJobError(
+                    "Ordered render join failed: "
+                    + join_proc.stderr.decode(errors="ignore")[-180:]
+                )
+            if not os.path.exists(joined_path) or os.path.getsize(joined_path) < 1000:
+                raise RetryableJobError("Ordered render join produced an empty file")
+
+            actual_duration, stream_types = await asyncio.gather(
+                asyncio.to_thread(get_media_duration, joined_path),
+                asyncio.to_thread(get_media_stream_types, joined_path),
+            )
+            if actual_duration < max(0.5, duration * 0.95):
+                raise RetryableJobError("Joined render is shorter than the source timeline")
+            if actual_duration > duration * 1.05 + 0.5:
+                raise RetryableJobError("Joined render exceeds the source timeline")
+            if not {"video", "audio"}.issubset(stream_types):
+                raise RetryableJobError("Joined render is missing audio/video streams")
+
+            actual_size = os.path.getsize(joined_path)
+            difference = abs(actual_size - target_bytes)
+            if best_difference is None or difference < best_difference:
+                if best_path and best_path != joined_path:
+                    remove_files([best_path])
+                best_path = joined_path
+                best_difference = difference
+                best_size = actual_size
+            elif best_path != joined_path:
+                remove_files([joined_path])
+
+            await report_aggregate(
+                stats={
+                    "out_time_ms": str(int(actual_duration * 1_000_000)),
+                    "total_size": str(actual_size),
+                    "speed": "N/A",
+                },
+                validated=True,
+            )
+            if target_bytes * 0.90 <= actual_size <= target_bytes * 1.03:
+                break
+            if attempt == 0:
+                correction = target_bytes / actual_size
+                video_bps = max(20_000, int(video_bps * correction * 0.985))
+        except Exception as exc:
+            last_error = exc
+            logger.warning("Parallel render attempt %s failed: %s", attempt + 1, str(exc)[:220])
+            if best_path != joined_path:
+                remove_files([joined_path])
+        finally:
+            remove_files(part_paths + [concat_path])
+
+    if not best_path:
+        raise RuntimeError("Parallel FFmpeg workers could not create a valid final video") from last_error
+
+    if os.path.abspath(best_path) != os.path.abspath(output_path):
+        os.replace(best_path, output_path)
+    logger.info(
+        "Joined %s render parts toward %s target; final size is %s",
+        workers,
+        human_file_size(target_bytes),
+        human_file_size(best_size),
+    )
+    return best_size
+
+
+async def encode_video_to_target_size(
+    input_path: str,
+    output_path: str,
+    target_bytes: int,
+    duration: float,
+    audio_path: str = None,
+    progress_callback=None,
+) -> int:
+    """Use bounded parallel parts, retaining the original encoder as fallback."""
+    if PIPELINE_WORKERS <= 1 or duration < 1.0:
+        return await encode_video_to_target_size_sequential(
+            input_path,
+            output_path,
+            target_bytes,
+            duration,
+            audio_path,
+            progress_callback,
+        )
+    try:
+        return await encode_video_to_target_size_parallel(
+            input_path,
+            output_path,
+            target_bytes,
+            duration,
+            audio_path,
+            progress_callback,
+            worker_count=PIPELINE_WORKERS,
+        )
+    except Exception as exc:
+        logger.warning("Falling back to sequential target encoding: %s", str(exc)[:180])
+        if progress_callback:
+            await progress_callback(
+                {
+                    "out_time_ms": "0",
+                    "total_size": "0",
+                    "speed": "N/A",
+                    "sequential_fallback": "1",
+                },
+                1,
+            )
+        return await encode_video_to_target_size_sequential(
+            input_path,
+            output_path,
+            target_bytes,
+            duration,
+            audio_path,
+            progress_callback,
+        )
 
 
 async def split_video_for_telegram(final_video: str, work_dir: str) -> list[str]:
@@ -3334,11 +4315,15 @@ async def handle_video_job(chat_id: int, reply_msg_id: int, url: str, job_id: st
 
             target_size = max(1000, int(original_size * FINAL_SIZE_RATIO))
             estimated_audio_scratch = int(dur * SAMPLE_RATE * 6)
+            # A corrective parallel attempt can coexist with the previous best
+            # joined file and the current part set. Reserve all three up front.
+            render_scratch = target_size * (3 if PIPELINE_WORKERS > 1 else 2)
+            required_scratch = estimated_audio_scratch + render_scratch
             free_bytes = shutil.disk_usage(work_dir).free
-            if free_bytes < target_size + estimated_audio_scratch:
+            if free_bytes < required_scratch:
                 raise PermanentJobError(
                     "Server disk space is insufficient; about "
-                    f"{human_file_size(target_size + estimated_audio_scratch)} more is required"
+                    f"{human_file_size(required_scratch)} more is required"
                 )
 
             audio_mp3 = os.path.join(work_dir, "speech.mp3")
@@ -3390,7 +4375,7 @@ async def handle_video_job(chat_id: int, reply_msg_id: int, url: str, job_id: st
             progress.unwatch()
             await progress.set_stage(
                 "script",
-                "Gemini is writing the complete first-person Myanmar recap…",
+                f"{PIPELINE_WORKERS} worker(s) · shared-story, complete first-person Myanmar recap…",
             )
             wav_8k = (
                 np.memmap(audio_8k_pcm, dtype=np.int16, mode="r")
@@ -3419,11 +4404,14 @@ async def handle_video_job(chat_id: int, reply_msg_id: int, url: str, job_id: st
                     pass
             if not segments:
                 raise PermanentJobError("No speech was found for a recap")
-            await progress.complete("script", f"{len(segments)} first-person segments")
+            await progress.complete(
+                "script",
+                f"{PIPELINE_WORKERS} worker(s) · {len(segments)} ordered first-person segments",
+            )
 
             await progress.set_stage(
                 "voice",
-                f"0/{len(segments)} segments · selecting narrator…",
+                f"0/{len(segments)} segments · {PIPELINE_WORKERS} worker(s) · locking Voice-01/provider…",
             )
 
             voice_stats = {"successful": 0}
@@ -3431,7 +4419,10 @@ async def handle_video_job(chat_id: int, reply_msg_id: int, url: str, job_id: st
             async def voice_progress(processed, total, successful):
                 voice_stats["successful"] = successful
                 await progress.update(
-                    detail=f"{processed}/{total} processed · {successful} synthesized",
+                    detail=(
+                        f"{PIPELINE_WORKERS} worker(s) · {processed}/{total} prepared · "
+                        f"{successful} mixed in script order"
+                    ),
                     force=processed == 1 or processed == total or processed % 3 == 0,
                 )
 
@@ -3457,12 +4448,13 @@ async def handle_video_job(chat_id: int, reply_msg_id: int, url: str, job_id: st
             await progress.complete(
                 "voice",
                 f"{voice_stats['successful']}/{len(segments)} synthesized · "
-                f"{format_mb(dub_size)} · {tts_provider}",
+                f"{PIPELINE_WORKERS} worker(s) · {format_mb(dub_size)} · {tts_provider}",
             )
 
             await progress.set_stage(
                 "render",
-                f"Encoding toward {format_mb(target_size)} ({int(FINAL_SIZE_RATIO * 100)}%)…",
+                f"{PIPELINE_WORKERS} worker(s) · encoding toward {format_mb(target_size)} "
+                f"({int(FINAL_SIZE_RATIO * 100)}%)…",
                 current=0,
                 total=target_size,
             )
@@ -3480,7 +4472,20 @@ async def handle_video_job(chat_id: int, reply_msg_id: int, url: str, job_id: st
                     written_bytes = None
                 timeline_percent = min(100, int(encoded_seconds / max(dur, 0.001) * 100))
                 speed = str(stats.get("speed", "")).strip()
-                pass_label = f"Corrective pass {encode_pass}/2" if encode_pass > 1 else "Encoding"
+                part_count = str(stats.get("pipeline_parts", "")).strip()
+                if stats.get("sequential_fallback"):
+                    pass_label = "Sequential render fallback"
+                elif stats.get("validated"):
+                    pass_label = f"Validated {part_count or 'all'} ordered parts"
+                elif stats.get("joining"):
+                    pass_label = f"Joining {part_count or 'all'} parts in order"
+                elif part_count:
+                    pass_label = (
+                        f"{part_count} render parts · "
+                        f"{stats.get('parts_complete', '0')} complete"
+                    )
+                else:
+                    pass_label = f"Corrective pass {encode_pass}/2" if encode_pass > 1 else "Encoding"
                 detail = f"{pass_label} · {timeline_percent}% timeline"
                 if speed and speed != "N/A":
                     detail += f" · {speed}"
