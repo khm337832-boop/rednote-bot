@@ -2551,14 +2551,145 @@ def calculate_encoding_bitrates(target_bytes: int, duration: float) -> tuple[int
     return video_bps, audio_bps
 
 
+def process_cpu_seconds(pid: int):
+    """Read Linux process CPU time so a quiet but busy encoder is not killed."""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as stat_file:
+            data = stat_file.read()
+        # The executable name is parenthesized and may itself contain spaces.
+        fields = data[data.rfind(b")") + 2 :].split()
+        ticks = int(fields[11]) + int(fields[12])
+        return ticks / os.sysconf("SC_CLK_TCK")
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+async def stop_subprocess(process) -> None:
+    """Terminate a stuck child and reap it before a retry starts."""
+    if process.returncode is not None:
+        return
+    try:
+        process.terminate()
+        await asyncio.wait_for(process.wait(), timeout=5.0)
+    except (ProcessLookupError, asyncio.TimeoutError):
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        await process.wait()
+
+
+async def run_ffmpeg_with_progress(cmd: list[str], timeout: int, progress_callback=None):
+    """Run FFmpeg with machine-readable stats and recover from a genuine stall."""
+    process = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    started = time.monotonic()
+    last_activity = started
+    last_signature = None
+    last_cpu = process_cpu_seconds(process.pid)
+    stats = {}
+    stderr_buffer = bytearray()
+    readline_task = None
+    completed = False
+
+    async def drain_stderr():
+        while True:
+            chunk = await process.stderr.read(4096)
+            if not chunk:
+                break
+            stderr_buffer.extend(chunk)
+            if len(stderr_buffer) > 65_536:
+                del stderr_buffer[:-65_536]
+
+    stderr_task = asyncio.create_task(drain_stderr())
+    poll_interval = min(2.0, max(0.05, float(PROGRESS_WATCH_INTERVAL)))
+    try:
+        readline_task = asyncio.create_task(process.stdout.readline())
+        while True:
+            done, _ = await asyncio.wait({readline_task}, timeout=poll_interval)
+            now = time.monotonic()
+            if now - started > timeout:
+                raise RetryableJobError(f"FFmpeg render exceeded the {timeout}s timeout")
+            if not done:
+                if now - last_activity < PROGRESS_STALL_SECONDS:
+                    continue
+                current_cpu = process_cpu_seconds(process.pid)
+                if (
+                    current_cpu is not None
+                    and last_cpu is not None
+                    and current_cpu > last_cpu + 0.01
+                ):
+                    # No stats can be normal during a hard frame or MP4 metadata
+                    # flush. Advancing CPU time proves the encoder is still busy.
+                    last_cpu = current_cpu
+                    last_activity = now
+                    continue
+                raise RetryableJobError(
+                    f"FFmpeg made no progress and used no CPU for {PROGRESS_STALL_SECONDS}s"
+                )
+
+            line = readline_task.result()
+            if not line:
+                break
+            readline_task = asyncio.create_task(process.stdout.readline())
+            text = line.decode("utf-8", errors="replace").strip()
+            if "=" not in text:
+                continue
+            key, value = text.split("=", 1)
+            stats[key.strip()] = value.strip()
+            if key.strip() != "progress":
+                continue
+
+            signature = (
+                stats.get("frame"),
+                stats.get("out_time_ms"),
+                stats.get("total_size"),
+            )
+            if signature != last_signature:
+                last_signature = signature
+                last_activity = time.monotonic()
+            if progress_callback:
+                await progress_callback(dict(stats))
+            stats = {}
+
+        remaining = max(0.1, timeout - (time.monotonic() - started))
+        try:
+            await asyncio.wait_for(process.wait(), timeout=remaining)
+        except asyncio.TimeoutError:
+            raise RetryableJobError(f"FFmpeg render exceeded the {timeout}s timeout") from None
+        await stderr_task
+        completed = True
+        return subprocess.CompletedProcess(
+            cmd,
+            process.returncode,
+            stdout=None,
+            stderr=bytes(stderr_buffer),
+        )
+    finally:
+        if not completed and process.returncode is None:
+            await stop_subprocess(process)
+        if readline_task and not readline_task.done():
+            readline_task.cancel()
+        if not stderr_task.done():
+            stderr_task.cancel()
+        cleanup_tasks = [stderr_task]
+        if readline_task is not None:
+            cleanup_tasks.append(readline_task)
+        await asyncio.gather(*cleanup_tasks, return_exceptions=True)
+
+
 async def encode_video_to_target_size(
     input_path: str,
     output_path: str,
     target_bytes: int,
     duration: float,
     audio_path: str = None,
+    progress_callback=None,
 ) -> int:
-    """Encode near a byte target, with one corrective pass when ABR misses it."""
+    """Encode near a byte target, with live FFmpeg stats and one corrective pass."""
     base_video_bps, audio_bps = calculate_encoding_bitrates(target_bytes, duration)
     video_bps = base_video_bps
     best_path = None
@@ -2576,7 +2707,18 @@ async def encode_video_to_target_size(
         else:
             max_width = 1920
 
-        cmd = ["ffmpeg", "-y", "-i", input_path]
+        cmd = [
+            "ffmpeg",
+            "-hide_banner",
+            "-nostats",
+            "-loglevel",
+            "warning",
+            "-progress",
+            "pipe:1",
+            "-y",
+            "-i",
+            input_path,
+        ]
         if audio_path:
             cmd += ["-i", audio_path]
         cmd += ["-map", "0:v:0", "-map", "1:a:0" if audio_path else "0:a:0?"]
@@ -2616,7 +2758,15 @@ async def encode_video_to_target_size(
             "+faststart",
             attempt_path,
         ]
-        proc = await asyncio.to_thread(run_cmd, cmd, FFMPEG_TIMEOUT)
+        async def report_attempt_progress(stats):
+            if progress_callback:
+                await progress_callback(stats, attempt + 1)
+
+        proc = await run_ffmpeg_with_progress(
+            cmd,
+            FFMPEG_TIMEOUT,
+            progress_callback=report_attempt_progress if progress_callback else None,
+        )
         if proc.returncode != 0:
             logger.warning("Target encode failed: %s", proc.stderr.decode(errors="ignore")[-300:])
             continue
@@ -3159,6 +3309,28 @@ async def handle_video_job(chat_id: int, reply_msg_id: int, url: str, job_id: st
             final_video = os.path.join(work_dir, "final_mm.mp4")
             progress.watch_pattern(os.path.join(work_dir, "final_mm*.mp4"))
 
+            async def render_progress(stats, encode_pass):
+                try:
+                    encoded_seconds = max(0.0, float(stats.get("out_time_ms", 0)) / 1_000_000)
+                except (TypeError, ValueError):
+                    encoded_seconds = 0.0
+                try:
+                    written_bytes = max(0, int(stats.get("total_size", 0)))
+                except (TypeError, ValueError):
+                    written_bytes = None
+                timeline_percent = min(100, int(encoded_seconds / max(dur, 0.001) * 100))
+                speed = str(stats.get("speed", "")).strip()
+                pass_label = f"Corrective pass {encode_pass}/2" if encode_pass > 1 else "Encoding"
+                detail = f"{pass_label} · {timeline_percent}% timeline"
+                if speed and speed != "N/A":
+                    detail += f" · {speed}"
+                detail += f" · {int(FINAL_SIZE_RATIO * 100)}% size target"
+                await progress.update(
+                    detail=detail,
+                    current=written_bytes,
+                    total=target_size,
+                )
+
             async def render_stage():
                 return await encode_video_to_target_size(
                     orig_video,
@@ -3166,6 +3338,7 @@ async def handle_video_job(chat_id: int, reply_msg_id: int, url: str, job_id: st
                     target_size,
                     dur,
                     dub_mp3,
+                    progress_callback=render_progress,
                 )
 
             final_size = await run_with_retries(render_stage, progress, "render")

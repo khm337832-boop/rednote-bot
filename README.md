@@ -13,11 +13,11 @@ Rednote (小红书) video link ကို Telegram bot ဆီ ပို့လိ�
 - `/usecharon` — ဒီ chat အတွက် voice clone ကို bypass လုပ်ပြီး Charon Deep voice ကို သုံးပါတယ်။
 - Main menu မှာ **New Recap, Clone Voice, Voice-01, Voice Test, Voice Lab, Help, Status** inline buttons ပါပါတယ်။ DYY ON/OFF button မလိုအပ်တော့ပါဘူး။
 - **Voice Lab** ထဲမှာ Clone Voice, Voice Test, Voice-01, Charon Deep, Main Menu, Status buttons ရှိပြီး active narrator ကိုပါ ပြပါတယ်။
-- Job progress ကို `DOWNLOADING → SCRIPT WRITING → VOICEOVER → RENDERING → UPLOADING` structured card တစ်ခုထဲမှာ ပြပါတယ်။ Download/render မှာ **MB + progress bar**၊ voiceover မှာ segment count၊ upload မှာ part count နဲ့ delivered MB ပါပါတယ်။
+- Job progress ကို `DOWNLOADING → SCRIPT WRITING → VOICEOVER → RENDERING → UPLOADING` structured card တစ်ခုထဲမှာ ပြပါတယ်။ Download/render မှာ **MB + progress bar**၊ voiceover မှာ segment count၊ upload မှာ part count နဲ့ delivered MB ပါပါတယ်။ Rendering မှာ FFmpeg ရဲ့ actual `out_time / total_size / speed` ကို ဖတ်ပြီး **timeline % + written MB + encoding speed** ကို live update လုပ်ပါတယ်။ Corrective pass ဆိုရင် pass 2/2 ကိုပါ ခွဲပြပါတယ်။
 - Built-in **DYY Agent** က preference သို့မဟုတ် ON/OFF switch မပါဘဲ **အမြဲတမ်း active** ဖြစ်ပါတယ်။ `/start` ရဲ့ usage guide ကအစ၊ link လက်ခံ/queue၊ stage transitions၊ stage completion၊ retries၊ watchdog checks၊ errors နဲ့ final success အထိ user ကို **“ဆရာ”** ဟုခေါ်ကာ live report ပို့ပါတယ်။
 - DYY က event context အလိုက် နောက်ဆက်အဆင့်ကို ရှင်းပြပါတယ်။ ဥပမာ—retry/watchdog အချိန်မှာ link ထပ်ပို့စရာမလိုကြောင်း၊ no-audio/private-link/config/storage error အမျိုးအစားအလိုက် သက်ဆိုင်ရာ next action ကို လမ်းညွှန်ပါတယ်။ ဒါက existing bot events ကိုသုံးတဲ့ built-in rule-based guidance ဖြစ်ပြီး added paid AI service/API key မလိုပါဘူး။
 - မိနစ်ပိုင်းလိုက်/byte ပိုင်းလိုက်ပြောင်းတဲ့ frequent MB updates ကိုတော့ DYY message အများကြီး မပို့ဘဲ structured progress card ထဲမှာပဲ ထားပါတယ်။ Monitoring message ပို့တာ error တစ်ခု ဖြစ်ရင်လည်း Recap job ကို မရပ်စေပါဘူး။
-- Progress silence **၆၀ စက္ကန့်** ရှိရင် watchdog က job task/file-size activity ကို စစ်ပြီး card မှာ အသိပေးပါတယ်။ Legitimate long-running job ကို silence တစ်ခုတည်းနဲ့ ချက်ချင်း fail မလုပ်ပါဘူး။
+- Progress silence **၆၀ စက္ကန့်** ရှိရင် watchdog က job task/file-size activity ကို စစ်ပြီး card မှာ အသိပေးပါတယ်။ Rendering process အတွက်ကိုက FFmpeg stats အသစ်မရတော့ဘဲ **CPU time လည်း မတက်တော့တဲ့ ၆၀ စက္ကန့်** ဖြစ်မှသာ stuck process ကို terminate/reap လုပ်ပြီး automatic retry လုပ်ပါတယ်။ CPU က ဆက်တက်နေတဲ့ legitimate long render ကို silence တစ်ခုတည်းနဲ့ ဖြတ်မထွင်းပါဘူး။
 - Timeout/network/rate-limit အစရှိတဲ့ transient errors ကို configurable attempts နဲ့ automatic retry လုပ်ပါတယ်။ No audio/disk full/api key အစရှိတဲ့ permanent errors ကို automatic retry မလုပ်ပါဘူး။
 - Job fail ဖြစ်ရင် **🔄 Retry Job** inline button ပါပါတယ်။ Button က မူရင်း link ကနေ job အသစ် restart လုပ်ပေးပြီး၊ retry data က memory-only ဖြစ်ပြီး TTL သတ်မှတ်ထားပါတယ်။ Server restart နောက်ပိုင်း expired button ဆိုရင် link ပြန်ပို့ရပါမယ်။
 - Browser status page ကို responsive dark dashboard အဖြစ် `/` မှာ ပြထားပြီး၊ `/health` က Render health check အတွက်ပါ။
@@ -88,7 +88,7 @@ Repository ထဲမှာ `Dockerfile` နဲ့ `render.yaml` ပါပြီ�
 | `TELEGRAM_UPLOAD_TIMEOUT` | Default `7200` seconds |
 | `PROGRESS_EDIT_INTERVAL` | Default `3.0` seconds — Telegram progress edit throttle |
 | `PROGRESS_WATCH_INTERVAL` | Default `5` seconds — watchdog polling interval |
-| `PROGRESS_STALL_SECONDS` | Default `60` seconds — silence ဖြစ်ရင် watchdog check လုပ်ရန် |
+| `PROGRESS_STALL_SECONDS` | Default `60` seconds — watchdog check နဲ့ FFmpeg stats/CPU နှစ်ခုလုံး ရပ်နေတဲ့ render stall detection |
 | `JOB_MAX_ATTEMPTS` | Default `3` — transient stage failure အတွက် စုစုပေါင်း attempts |
 | `JOB_RETRY_DELAY_SECONDS` | Default `5` — retry အကြား base delay; attempt အလိုက် တိုးတယ် |
 | `RETRY_JOB_TTL_SECONDS` | Default `86400` — memory-only manual Retry button data သက်တမ်း |
@@ -101,7 +101,7 @@ Health check path က `/health` ဖြစ်ပြီး service စတင်ပ
 
 ## Tests
 
-API call မလုပ်ဘဲ script prompt၊ JSON parsing၊ PCM handling၊ voice-clone multipart/cache/provider priority၊ Telegram clone command၊ inline Voice Lab buttons၊ Voice Test audio upload၊ MB progress card၊ 60s watchdog၊ automatic/manual retry၊ DYY always-on/start guide/context-aware next steps/event isolation၊ source-credit/rights captions၊ target-size encoding correction နဲ့ Telegram splitting logic ကို စမ်းနိုင်ပါတယ်။
+API call မလုပ်ဘဲ script prompt၊ JSON parsing၊ PCM handling၊ voice-clone multipart/cache/provider priority၊ Telegram clone command၊ inline Voice Lab buttons၊ Voice Test audio upload၊ MB progress card၊ 60s watchdog၊ automatic/manual retry၊ DYY always-on/start guide/context-aware next steps/event isolation၊ source-credit/rights captions၊ target-size encoding correction၊ real subprocess FFmpeg-progress stream/stall cleanup နဲ့ Telegram splitting logic ကို စမ်းနိုင်ပါတယ်။
 
 ```bash
 python -m unittest discover -s tests -v

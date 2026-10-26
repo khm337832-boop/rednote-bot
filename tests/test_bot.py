@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import sys
 import tempfile
 import unittest
 import wave
@@ -320,16 +321,20 @@ class EncodingAndSplittingTests(unittest.TestCase):
     def test_target_encode_runs_corrective_pass(self):
         calls = []
 
-        def fake_run_cmd(cmd, timeout):
+        async def fake_run_ffmpeg(cmd, timeout, progress_callback=None):
             calls.append(cmd)
             output = cmd[-1]
             size = 800_000 if "attempt0" in output else 950_000
             with open(output, "wb") as output_file:
                 output_file.truncate(size)
+            if progress_callback:
+                await progress_callback(
+                    {"out_time_ms": "100000000", "total_size": str(size), "speed": "1.0x"}
+                )
             return SimpleNamespace(returncode=0, stderr=b"")
 
         with tempfile.TemporaryDirectory() as directory, patch.object(
-            bot, "run_cmd", side_effect=fake_run_cmd
+            bot, "run_ffmpeg_with_progress", side_effect=fake_run_ffmpeg
         ), patch.object(bot, "get_media_duration", return_value=100.0):
             source = os.path.join(directory, "source.mp4")
             audio = os.path.join(directory, "audio.mp3")
@@ -343,6 +348,68 @@ class EncodingAndSplittingTests(unittest.TestCase):
             self.assertEqual(os.path.getsize(output), 950_000)
             self.assertEqual(len(calls), 2)
             self.assertIn("-b:v", calls[0])
+            self.assertIn("-progress", calls[0])
+            self.assertIn("pipe:1", calls[0])
+
+    def test_ffmpeg_machine_progress_is_streamed_from_real_subprocess(self):
+        reports = []
+        script = (
+            "import sys;"
+            "sys.stdout.write('frame=25\\nout_time_ms=5000000\\ntotal_size=12345\\n"
+            "speed=1.2x\\nprogress=continue\\n');sys.stdout.flush();"
+            "sys.stdout.write('frame=50\\nout_time_ms=10000000\\ntotal_size=20000\\n"
+            "speed=1.1x\\nprogress=end\\n');sys.stdout.flush()"
+        )
+
+        async def report(stats):
+            reports.append(stats)
+
+        result = asyncio.run(
+            bot.run_ffmpeg_with_progress(
+                [sys.executable, "-u", "-c", script],
+                10,
+                progress_callback=report,
+            )
+        )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(len(reports), 2)
+        self.assertEqual(reports[0]["out_time_ms"], "5000000")
+        self.assertEqual(reports[0]["total_size"], "12345")
+        self.assertEqual(reports[1]["progress"], "end")
+
+    def test_idle_ffmpeg_process_is_stopped_and_marked_retryable(self):
+        started = bot.time.monotonic()
+
+        async def run_flow():
+            with patch.object(bot, "PROGRESS_STALL_SECONDS", 0.2), patch.object(
+                bot, "PROGRESS_WATCH_INTERVAL", 0.05
+            ), patch.object(bot, "process_cpu_seconds", return_value=0.0):
+                await bot.run_ffmpeg_with_progress(
+                    [sys.executable, "-c", "import time; time.sleep(30)"],
+                    10,
+                )
+
+        with self.assertRaises(bot.RetryableJobError) as raised:
+            asyncio.run(run_flow())
+
+        self.assertLess(bot.time.monotonic() - started, 5.0)
+        self.assertIn("no CPU", str(raised.exception))
+
+    def test_quiet_process_with_advancing_cpu_is_not_killed(self):
+        async def run_flow():
+            with patch.object(bot, "PROGRESS_STALL_SECONDS", 0.1), patch.object(
+                bot, "PROGRESS_WATCH_INTERVAL", 0.05
+            ), patch.object(
+                bot, "process_cpu_seconds", side_effect=lambda _pid: bot.time.monotonic()
+            ):
+                return await bot.run_ffmpeg_with_progress(
+                    [sys.executable, "-c", "import time; time.sleep(0.35)"],
+                    10,
+                )
+
+        result = asyncio.run(run_flow())
+        self.assertEqual(result.returncode, 0)
 
     def test_large_file_is_split_in_order_under_limit(self):
         def fake_run_cmd(cmd, timeout):
@@ -983,7 +1050,18 @@ class HandlerFlowTests(unittest.TestCase):
                 await progress_callback(len(segments), len(segments), len(segments))
             return "gemini"
 
-        async def fake_encode(source, output, target, duration, audio_path=None):
+        async def fake_encode(
+            source, output, target, duration, audio_path=None, progress_callback=None
+        ):
+            if progress_callback:
+                await progress_callback(
+                    {
+                        "out_time_ms": str(int(duration * 500_000)),
+                        "total_size": str(target // 2),
+                        "speed": "1.5x",
+                    },
+                    1,
+                )
             with open(output, "wb") as final_file:
                 final_file.truncate(target)
             return target
@@ -1021,7 +1099,7 @@ class HandlerFlowTests(unittest.TestCase):
             bot, "send_text", side_effect=fake_send_text
         ), patch.object(bot, "edit_text", side_effect=fake_edit_text), patch.object(
             bot, "tg_api", side_effect=fake_tg_api
-        ):
+        ), patch.object(bot, "PROGRESS_EDIT_INTERVAL", 0):
             asyncio.run(bot.handle_video_job(123, 456, "https://example.com/video"))
 
         self.assertEqual(len(sent_videos), 1)
@@ -1033,6 +1111,7 @@ class HandlerFlowTests(unittest.TestCase):
         self.assertTrue(all("ဆရာ" in text for text in dyy_messages))
         self.assertTrue(all("Always On" in text for text in dyy_messages))
         self.assertTrue(any("first-person" in text.lower() for text in edits))
+        self.assertTrue(any("50% timeline" in text and "1.5x" in text for text in edits))
         self.assertTrue(work_directories)
         self.assertFalse(os.path.exists(work_directories[0]))
 
