@@ -4,19 +4,19 @@ Rednote (小红书) video link ကို Telegram bot ဆီ ပို့လိ�
 
 ## Bot UI / Commands
 
-- `/start` — Welcome card နဲ့ feature menu ကို ပြပါတယ်။
+- `/start` — **DYY Agent** ကိုယ်တိုင် “ဆရာ” ဟုခေါ်ပြီး Rednote link ပို့ပုံကအစ အသုံးပြုပုံ၊ automatic workflow နဲ့ feature menu ကို ပြပါတယ်။ Activation command နောက်တစ်ခု ထပ်ရိုက်စရာမလိုပါဘူး။
 - `/help` — Link ပို့ပုံ၊ commands နဲ့ အကြံပြုချက်တွေကို ပြပါတယ်။
 - `/status` — Online/queue state၊ voice/provider နဲ့ output setting တွေကို ပြပါတယ်။
 - `/clonevoice` — Voice message/audio sample ကို ElevenLabs Instant Voice Clone လုပ်ပြီး ဒီ chat အတွက် active လုပ်ပါတယ်။ Preview အသံလည်း ပြန်ပို့ပါတယ်။
 - `/voicetest` — လက်ရှိရွေးထားတဲ့ narrator နဲ့ short Myanmar audio sample ထုတ်ပြီး Telegram မှာ ပြန်ပို့ပါတယ်။
 - `/voice01` — Custom clone ကိုဖြုတ်ပြီး bundled Voice-01 default reference ကို ပြန်သုံးပါတယ်။
 - `/usecharon` — ဒီ chat အတွက် voice clone ကို bypass လုပ်ပြီး Charon Deep voice ကို သုံးပါတယ်။
-- `/dyy` — DYY Agent ရဲ့ detailed monitoring reports ကို ဒီ chat အတွက် ON/OFF လုပ်ပါတယ်။ Main progress card ကတော့ OFF လုပ်ထားလည်း ဆက်အလုပ်လုပ်ပါတယ်။
-- Main menu မှာ **New Recap, Clone Voice, Voice-01, Voice Test, Voice Lab, DYY Agent, Help, Status** inline buttons ပါပါတယ်။
+- Main menu မှာ **New Recap, Clone Voice, Voice-01, Voice Test, Voice Lab, Help, Status** inline buttons ပါပါတယ်။ DYY ON/OFF button မလိုအပ်တော့ပါဘူး။
 - **Voice Lab** ထဲမှာ Clone Voice, Voice Test, Voice-01, Charon Deep, Main Menu, Status buttons ရှိပြီး active narrator ကိုပါ ပြပါတယ်။
 - Job progress ကို `DOWNLOADING → SCRIPT WRITING → VOICEOVER → RENDERING → UPLOADING` structured card တစ်ခုထဲမှာ ပြပါတယ်။ Download/render မှာ **MB + progress bar**၊ voiceover မှာ segment count၊ upload မှာ part count နဲ့ delivered MB ပါပါတယ်။
-- Built-in **DYY Agent** က အဲဒီ job events ကိုပဲ စောင့်ကြည့်ပြီး user ကို **“ဆရာ”** ဟု ခေါ်ကာ stage transitions၊ stage completion၊ retries၊ watchdog checks၊ errors နဲ့ final success ကို အသေးစိတ် report ပို့ပါတယ်။ Added paid AI service/API key မလိုပါဘူး။ မိနစ်ပိုင်းလိုက်/byte ပိုင်းလိုက်ပြောင်းတဲ့ frequent MB updates ကိုတော့ message အများကြီး မပို့ဘဲ structured progress card ထဲမှာပဲ ထားပါတယ်။
-- `/dyy` preference က chat-by-chat memory-only ဖြစ်ပြီး server restart/redeploy ရင် `DYY_AGENT_ENABLED` default သို့ ပြန်ရောက်ပါမယ်။ Monitoring message ပို့တာ error တစ်ခု ဖြစ်ရင်လည်း Recap job ကို မရပ်စေပါဘူး။
+- Built-in **DYY Agent** က preference သို့မဟုတ် ON/OFF switch မပါဘဲ **အမြဲတမ်း active** ဖြစ်ပါတယ်။ `/start` ရဲ့ usage guide ကအစ၊ link လက်ခံ/queue၊ stage transitions၊ stage completion၊ retries၊ watchdog checks၊ errors နဲ့ final success အထိ user ကို **“ဆရာ”** ဟုခေါ်ကာ live report ပို့ပါတယ်။
+- DYY က event context အလိုက် နောက်ဆက်အဆင့်ကို ရှင်းပြပါတယ်။ ဥပမာ—retry/watchdog အချိန်မှာ link ထပ်ပို့စရာမလိုကြောင်း၊ no-audio/private-link/config/storage error အမျိုးအစားအလိုက် သက်ဆိုင်ရာ next action ကို လမ်းညွှန်ပါတယ်။ ဒါက existing bot events ကိုသုံးတဲ့ built-in rule-based guidance ဖြစ်ပြီး added paid AI service/API key မလိုပါဘူး။
+- မိနစ်ပိုင်းလိုက်/byte ပိုင်းလိုက်ပြောင်းတဲ့ frequent MB updates ကိုတော့ DYY message အများကြီး မပို့ဘဲ structured progress card ထဲမှာပဲ ထားပါတယ်။ Monitoring message ပို့တာ error တစ်ခု ဖြစ်ရင်လည်း Recap job ကို မရပ်စေပါဘူး။
 - Progress silence **၆၀ စက္ကန့်** ရှိရင် watchdog က job task/file-size activity ကို စစ်ပြီး card မှာ အသိပေးပါတယ်။ Legitimate long-running job ကို silence တစ်ခုတည်းနဲ့ ချက်ချင်း fail မလုပ်ပါဘူး။
 - Timeout/network/rate-limit အစရှိတဲ့ transient errors ကို configurable attempts နဲ့ automatic retry လုပ်ပါတယ်။ No audio/disk full/api key အစရှိတဲ့ permanent errors ကို automatic retry မလုပ်ပါဘူး။
 - Job fail ဖြစ်ရင် **🔄 Retry Job** inline button ပါပါတယ်။ Button က မူရင်း link ကနေ job အသစ် restart လုပ်ပေးပြီး၊ retry data က memory-only ဖြစ်ပြီး TTL သတ်မှတ်ထားပါတယ်။ Server restart နောက်ပိုင်း expired button ဆိုရင် link ပြန်ပို့ရပါမယ်။
@@ -77,7 +77,6 @@ Repository ထဲမှာ `Dockerfile` နဲ့ `render.yaml` ပါပြီ�
 | `VOICE_CLONE_CACHE_PATH` | Default `data/voice_clones.json`; cloned voice IDs နဲ့ per-chat selections သိမ်းရာနေရာ (persistent disk ရှိရင် path ပြောင်းနိုင်တယ်) |
 | `VOICE_CLONE_MAX_BYTES` | Default `20000000`; Telegram reference အများဆုံး file size |
 | `VOICE_CLONE_MAX_SECONDS` | Default `180`; reference ကို အဲဒီမိနစ်အထိ trim လုပ်တယ် |
-| `DYY_AGENT_ENABLED` | Default `true`; DYY detailed event reports ရဲ့ chat default; `/dyy` ဖြင့် chat-by-chat ON/OFF လုပ်နိုင်တယ် |
 | `SOURCE_CREDIT_ENABLED` | Default `true`; delivered ပထမ part caption မှာ မူရင်း source link ထည့်ရန် |
 | `COPYRIGHT_NOTICE_ENABLED` | Default `true`; delivered ပထမ part caption မှာ recap/rights context ထည့်ရန်; copyright immunity ကို မပေးပါဘူး |
 | `FINAL_SIZE_RATIO` | Default `0.8` — မူရင်း file size ရဲ့ ၈၀% |
@@ -102,7 +101,7 @@ Health check path က `/health` ဖြစ်ပြီး service စတင်ပ
 
 ## Tests
 
-API call မလုပ်ဘဲ script prompt၊ JSON parsing၊ PCM handling၊ voice-clone multipart/cache/provider priority၊ Telegram clone command၊ inline Voice Lab buttons၊ Voice Test audio upload၊ MB progress card၊ 60s watchdog၊ automatic/manual retry၊ DYY salutation/ON-OFF/event isolation၊ source-credit/rights captions၊ target-size encoding correction နဲ့ Telegram splitting logic ကို စမ်းနိုင်ပါတယ်။
+API call မလုပ်ဘဲ script prompt၊ JSON parsing၊ PCM handling၊ voice-clone multipart/cache/provider priority၊ Telegram clone command၊ inline Voice Lab buttons၊ Voice Test audio upload၊ MB progress card၊ 60s watchdog၊ automatic/manual retry၊ DYY always-on/start guide/context-aware next steps/event isolation၊ source-credit/rights captions၊ target-size encoding correction နဲ့ Telegram splitting logic ကို စမ်းနိုင်ပါတယ်။
 
 ```bash
 python -m unittest discover -s tests -v
