@@ -1,14 +1,17 @@
 import asyncio
 import base64
+import glob
 import hashlib
 import html
 import json
 import logging
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import tempfile
+import time
 import wave
 from collections import deque
 from contextlib import asynccontextmanager
@@ -93,11 +96,18 @@ TELEGRAM_PART_LIMIT_BYTES = min(
     48_000_000,
     env_int("TELEGRAM_PART_LIMIT_BYTES", 48_000_000, 1024 * 1024),
 )
+PROGRESS_EDIT_INTERVAL = env_float("PROGRESS_EDIT_INTERVAL", 3.0)
+PROGRESS_WATCH_INTERVAL = env_int("PROGRESS_WATCH_INTERVAL", 5, 1)
+PROGRESS_STALL_SECONDS = env_int("PROGRESS_STALL_SECONDS", 60, 15)
+JOB_MAX_ATTEMPTS = env_int("JOB_MAX_ATTEMPTS", 3, 1)
+JOB_RETRY_DELAY_SECONDS = env_int("JOB_RETRY_DELAY_SECONDS", 5, 1)
+RETRY_JOB_TTL_SECONDS = env_int("RETRY_JOB_TTL_SECONDS", 86400, 60)
 
 processed_updates = deque(maxlen=500)
 job_semaphore = asyncio.Semaphore(1)
 voice_clone_lock = asyncio.Lock()
 background_jobs = set()
+retry_jobs = {}
 voice01_clone_id = ""
 
 
@@ -222,6 +232,7 @@ def welcome_message() -> str:
         "┣ 🎙️ <b>Voice-01 clone</b> ဦးစားပေး + Charon fallback\n"
         "┣ 🎧 <b>Voice Test / Voice Lab</b> ခလုတ်တွေနဲ့ အသံစမ်းနိုင်တယ်\n"
         "┣ 🎞️ Final size ကို မူရင်းရဲ့ <b>၈၀% ခန့်</b> လျှော့မယ်\n"
+        "┣ 🛡️ <b>MB progress + 60s watchdog + Retry</b> ပါမယ်\n"
         "┗ 📤 50MB ကျော်ရင် MP4 အပိုင်းလိုက် အလိုအလျောက် ပို့မယ်\n\n"
         "<b>📮 ဥပမာ</b>\n"
         "<code>http://xhslink.com/...</code>"
@@ -285,9 +296,11 @@ def help_message() -> str:
         "Voice message သို့မဟုတ် audio file ကို <code>/clonevoice</code> caption နဲ့ ပို့ပါ။ "
         "တစ်ယောက်တည်း၊ background music မပါတဲ့ ၁–၂ မိနစ် sample က အကောင်းဆုံးပါ။ "
         "သင့်အသံ သို့မဟုတ် ခွင့်ပြုချက်ရထားတဲ့ အသံကိုသာ သုံးပါ။\n\n"
-        "<b>💡 အကြံပြုချက်</b>\n"
-        "Video ကြီးရင် progress update ကို စောင့်ပေးပါနော်။ "
-        "တစ်ပြိုင်နက် job တစ်ခုချင်းစီ လုပ်ဆောင်ပါတယ်။"
+        "<b>💡 Progress & Retry</b>\n"
+        "Job card မှာ stage တစ်ဆင့်ချင်းနဲ့ MB/segment progress ကို ပြပါတယ်။ "
+        "Progress silence ၆၀ စက္ကန့်ရှိရင် watchdog စစ်ပါတယ်။ Transient error ဆို auto retry၊ "
+        "job ရပ်ရင် <b>🔄 Retry Job</b> ခလုတ်နဲ့ ပြန်စနိုင်ပါတယ်။\n\n"
+        "Video ကြီးရင် progress update ကို စောင့်ပေးပါနော်။ တစ်ပြိုင်နက် job တစ်ခုချင်းစီ လုပ်ဆောင်ပါတယ်။"
     )
 
 
@@ -322,6 +335,7 @@ def status_message(chat_id: int = None) -> str:
         f"┣ <b>Script timing:</b> Video ရဲ့ {int(SCRIPT_DURATION_RATIO * 100)}% ခန့်\n"
         f"┣ <b>DeepSeek polish:</b> {deepseek_status}\n"
         f"┣ <b>ElevenLabs fallback:</b> {elevenlabs_status}\n"
+        f"┣ <b>Watchdog / Retry:</b> {PROGRESS_STALL_SECONDS}s / {JOB_MAX_ATTEMPTS} attempts\n"
         f"┗ <b>Final size:</b> မူရင်းရဲ့ {int(FINAL_SIZE_RATIO * 100)}% ခန့်\n\n"
         "<i>Link တစ်ခု ပို့ပြီး Recap စတင်နိုင်ပါပြီ။</i>"
     )
@@ -342,20 +356,20 @@ async def send_text(chat_id: int, text: str, reply_to: int = None, reply_markup:
     return res.get("result", {}).get("message_id")
 
 
-async def edit_text(chat_id: int, message_id: int, text: str):
+async def edit_text(chat_id: int, message_id: int, text: str, reply_markup: dict = None):
     if not message_id:
         return
+    payload = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
     try:
-        await tg_api(
-            "editMessageText",
-            {
-                "chat_id": chat_id,
-                "message_id": message_id,
-                "text": text,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": True,
-            },
-        )
+        await tg_api("editMessageText", payload)
     except Exception:
         pass
 
@@ -565,7 +579,30 @@ async def telegram_webhook(request: Request):
         action = callback.get("data")
         if chat_id:
             reply_id = callback_message.get("message_id")
-            if action in {"home", "help", "status"}:
+            if action and action.startswith("retry:"):
+                retry_id = action.split(":", 1)[1]
+                retry_data = get_retry_job(retry_id, chat_id)
+                if retry_data:
+                    retry_jobs.pop(retry_id, None)
+                    schedule_background(
+                        handle_video_job(
+                            chat_id,
+                            retry_data["reply_msg_id"],
+                            retry_data["url"],
+                            job_id=retry_id,
+                        )
+                    )
+                else:
+                    schedule_background(
+                        send_text(
+                            chat_id,
+                            "<b>⌛ RETRY EXPIRED</b>\n"
+                            "ဒီ retry link က သက်တမ်းကုန် သို့မဟုတ် server restart ဖြစ်သွားပါတယ်။ "
+                            "Rednote link ကို ပြန်ပို့ပြီး job အသစ်စတင်ပါ။",
+                            reply_markup=bot_menu_keyboard(),
+                        )
+                    )
+            elif action in {"home", "help", "status"}:
                 messages = {
                     "home": welcome_message,
                     "help": help_message,
@@ -1703,6 +1740,7 @@ async def synthesize_dubbed_track(
     work_dir: str,
     out_audio_path: str,
     clone_voice_id: str = None,
+    progress_callback=None,
 ):
     """Build a long narration track with disk-backed PCM instead of huge RAM arrays."""
     # The extra tail room preserves the previous 1.2-second allowance without
@@ -1839,6 +1877,11 @@ async def synthesize_dubbed_track(
                         os.remove(temporary_path)
                     except OSError:
                         pass
+            if progress_callback:
+                try:
+                    await progress_callback(idx + 1, len(segments), synthesized_count)
+                except Exception as callback_error:
+                    logger.warning("Voice progress callback failed: %s", str(callback_error)[:100])
 
     if synthesized_count == 0:
         del master_pcm
@@ -1909,6 +1952,366 @@ def human_file_size(size_bytes: int) -> str:
     if size_bytes >= 1024 ** 2:
         return f"{size_bytes / 1024 ** 2:.1f} MB"
     return f"{max(0, size_bytes) / 1024:.0f} KB"
+
+
+JOB_STAGES = [
+    ("download", "📥 Download"),
+    ("script", "✍️ Script"),
+    ("voice", "🎙️ Voiceover"),
+    ("render", "🎞️ Rendering"),
+    ("upload", "📤 Uploading"),
+]
+
+
+class PermanentJobError(RuntimeError):
+    """An input/configuration error that should not be retried automatically."""
+
+
+class RetryableJobError(RuntimeError):
+    """A transient stage failure that can be retried safely."""
+
+
+def format_mb(size_bytes) -> str:
+    if size_bytes is None:
+        return "—"
+    return f"{max(0.0, float(size_bytes)) / 1_000_000:.1f} MB"
+
+
+def make_progress_bar(current, total, width: int = 12) -> str:
+    if not total or total <= 0:
+        return "░" * width
+    ratio = min(1.0, max(0.0, float(current or 0) / float(total)))
+    filled = min(width, max(0, round(ratio * width)))
+    return f"{'█' * filled}{'░' * (width - filled)} {ratio * 100:.0f}%"
+
+
+def retry_keyboard(job_id: str) -> dict:
+    return {
+        "inline_keyboard": [
+            [{"text": "🔄 Retry Job", "callback_data": f"retry:{job_id}"}],
+            [{"text": "🟢 Bot Status", "callback_data": "status"}],
+        ]
+    }
+
+
+def remember_retry_job(job_id: str, chat_id: int, reply_msg_id: int, url: str) -> None:
+    now = time.time()
+    for key, value in list(retry_jobs.items()):
+        if now - value.get("created", now) > RETRY_JOB_TTL_SECONDS:
+            retry_jobs.pop(key, None)
+    while len(retry_jobs) >= 100:
+        retry_jobs.pop(next(iter(retry_jobs)))
+    retry_jobs[job_id] = {
+        "chat_id": chat_id,
+        "reply_msg_id": reply_msg_id,
+        "url": url,
+        "created": now,
+    }
+
+
+def get_retry_job(job_id: str, chat_id: int) -> dict:
+    value = retry_jobs.get(job_id) or {}
+    if not value or value.get("chat_id") != chat_id:
+        return {}
+    if time.time() - value.get("created", 0) > RETRY_JOB_TTL_SECONDS:
+        retry_jobs.pop(job_id, None)
+        return {}
+    return value
+
+
+def is_transient_error(exc: BaseException) -> bool:
+    if isinstance(exc, PermanentJobError):
+        return False
+    if isinstance(exc, RetryableJobError):
+        return True
+    if isinstance(
+        exc,
+        (
+            asyncio.TimeoutError,
+            subprocess.TimeoutExpired,
+            httpx.TimeoutException,
+            httpx.NetworkError,
+            ConnectionError,
+        ),
+    ):
+        return True
+    message = str(exc).lower()
+    permanent_markers = (
+        "api key",
+        "no audio",
+        "no speech",
+        "disk space",
+        "duration limit",
+        "unsupported",
+        "permission",
+        "verification",
+    )
+    if any(marker in message for marker in permanent_markers):
+        return False
+    transient_markers = (
+        "timeout",
+        "timed out",
+        "temporarily",
+        "connection",
+        "network",
+        "rate limit",
+        "429",
+        "http 5",
+        "503",
+        "502",
+        "500",
+        "download failed",
+    )
+    return any(marker in message for marker in transient_markers)
+
+
+async def run_with_retries(operation, progress, stage: str):
+    """Retry only transient failures; permanent input/quota errors fail immediately."""
+    last_error = None
+    for attempt in range(1, JOB_MAX_ATTEMPTS + 1):
+        progress.attempt = attempt
+        try:
+            result = await operation()
+            progress.notice = ""
+            return result
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            last_error = exc
+            if attempt >= JOB_MAX_ATTEMPTS or not is_transient_error(exc):
+                raise
+            logger.warning(
+                "Retrying job %s stage %s after attempt %s: %s",
+                progress.job_id,
+                stage,
+                attempt,
+                str(exc)[:140],
+            )
+            progress.notice = f"Attempt {attempt} failed; automatic retry is starting."
+            await progress.update(
+                detail=f"Attempt {attempt} failed · retrying {stage}…",
+                force=True,
+            )
+            await asyncio.sleep(JOB_RETRY_DELAY_SECONDS * attempt)
+    raise last_error
+
+
+class JobProgress:
+    """A throttled Telegram progress card with byte monitoring and a 60s watchdog."""
+
+    def __init__(self, chat_id: int, message_id: int, job_id: str):
+        self.chat_id = chat_id
+        self.message_id = message_id
+        self.job_id = job_id
+        self.stage = "download"
+        self.detail = "Waiting for a worker…"
+        self.details = {}
+        self.completed = set()
+        self.current = None
+        self.total = None
+        self.attempt = 1
+        self.error = ""
+        self.finished = False
+        self.retry_available = True
+        self.notice = ""
+        self.watchdog_checks = 0
+        self.last_activity = time.monotonic()
+        self.last_edit = 0.0
+        self.last_watchdog_notice = 0.0
+        self.last_text = ""
+        self.watch_path = None
+        self.watch_glob = None
+        self.job_task = None
+        self.tasks = []
+        self._edit_lock = asyncio.Lock()
+
+    @property
+    def idle_seconds(self) -> float:
+        return max(0.0, time.monotonic() - self.last_activity)
+
+    def render(self) -> str:
+        if self.error:
+            heading = "❌ JOB STOPPED"
+        elif self.finished:
+            heading = "✅ RECAP COMPLETE"
+        else:
+            heading = "🎬 RECAP JOB"
+        lines = [
+            f"<b>{heading}</b> <code>#{html.escape(self.job_id)}</code>",
+            f"<i>Attempt {self.attempt} · 60-second watchdog enabled</i>",
+            "",
+        ]
+        for key, label in JOB_STAGES:
+            if key in self.completed:
+                icon = "✅"
+                detail = self.details.get(key, "Done")
+            elif key == self.stage:
+                icon = "❌" if self.error else ("✅" if self.finished else "🔄")
+                detail = self.detail
+            else:
+                icon = "⏳"
+                detail = "Waiting"
+            lines.append(f"{icon} <b>{label}</b> · {html.escape(str(detail))}")
+            if key == self.stage and key not in self.completed and self.current is not None:
+                current_text = format_mb(self.current)
+                if self.total:
+                    lines.append(
+                        f"   └ <code>{make_progress_bar(self.current, self.total)}</code> "
+                        f"{current_text} / {format_mb(self.total)}"
+                    )
+                else:
+                    lines.append(f"   └ <code>{current_text}</code>")
+        lines.append("")
+        if self.error:
+            lines.append(f"<b>Error:</b> {html.escape(self.error[:220])}")
+            if self.retry_available:
+                lines.append("<i>Use Retry Job to restart safely from the link.</i>")
+        elif self.finished:
+            lines.append(f"<b>{html.escape(self.detail)}</b>")
+        else:
+            lines.append(
+                f"<i>Last progress: {int(self.idle_seconds)}s ago · "
+                f"Watchdog checks after {PROGRESS_STALL_SECONDS}s of silence.</i>"
+            )
+        if self.notice and not self.error:
+            lines.append(f"<i>🛡️ {html.escape(self.notice)}</i>")
+        return "\n".join(lines)
+
+    async def refresh(self, force: bool = False) -> None:
+        async with self._edit_lock:
+            now = time.monotonic()
+            if not force and now - self.last_edit < PROGRESS_EDIT_INTERVAL:
+                return
+            text = self.render()
+            if text == self.last_text:
+                return
+            self.last_edit = now
+            self.last_text = text
+            markup = retry_keyboard(self.job_id) if self.error and self.retry_available else None
+            await edit_text(self.chat_id, self.message_id, text, reply_markup=markup)
+
+    async def set_stage(self, stage: str, detail: str, current=None, total=None, force=True):
+        self.stage = stage
+        self.detail = detail
+        self.current = current
+        self.total = total
+        self.last_activity = time.monotonic()
+        self.notice = ""
+        await self.refresh(force=force)
+
+    async def update(self, detail: str = None, current=None, total=None, force: bool = False):
+        changed = False
+        if detail is not None and detail != self.detail:
+            self.detail = detail
+            changed = True
+        if current is not None and current != self.current:
+            self.current = current
+            changed = True
+        if total is not None and total != self.total:
+            self.total = total
+            changed = True
+        if changed:
+            self.last_activity = time.monotonic()
+        await self.refresh(force=force)
+
+    async def complete(self, stage: str, detail: str, force: bool = True):
+        self.completed.add(stage)
+        self.details[stage] = detail
+        self.last_activity = time.monotonic()
+        await self.refresh(force=force)
+
+    def watch_file(self, path: str, total=None) -> None:
+        self.watch_path = path
+        self.watch_glob = None
+        if total is not None:
+            self.total = total
+
+    def watch_pattern(self, pattern: str, total=None) -> None:
+        self.watch_path = None
+        self.watch_glob = pattern
+        if total is not None:
+            self.total = total
+
+    def unwatch(self) -> None:
+        self.watch_path = None
+        self.watch_glob = None
+
+    def watched_size(self):
+        try:
+            if self.watch_path and os.path.isfile(self.watch_path):
+                return os.path.getsize(self.watch_path)
+            if self.watch_glob:
+                paths = [path for path in glob.glob(self.watch_glob) if os.path.isfile(path)]
+                if paths:
+                    newest = max(paths, key=os.path.getmtime)
+                    return os.path.getsize(newest)
+        except OSError:
+            return None
+        return None
+
+    async def _monitor_loop(self):
+        while True:
+            size = self.watched_size()
+            if size is not None and size != self.current:
+                self.current = size
+                self.last_activity = time.monotonic()
+                await self.refresh()
+            await asyncio.sleep(2.0)
+
+    async def check_watchdog(self) -> bool:
+        now = time.monotonic()
+        if self.finished or self.error or self.idle_seconds < PROGRESS_STALL_SECONDS:
+            return False
+        if now - self.last_watchdog_notice < PROGRESS_STALL_SECONDS:
+            return False
+        self.last_watchdog_notice = now
+        self.watchdog_checks += 1
+        task_alive = self.job_task is not None and not self.job_task.done()
+        size = self.watched_size()
+        size_text = f" · watched file {format_mb(size)}" if size is not None else ""
+        self.notice = (
+            f"Watchdog check {self.watchdog_checks}: {int(self.idle_seconds)}s without new progress; "
+            f"job task is {'still active' if task_alive else 'stopped'}{size_text}. "
+            "Retry is offered if the stage actually fails."
+        )
+        await self.refresh(force=True)
+        return True
+
+    async def _watchdog_loop(self):
+        while True:
+            await asyncio.sleep(PROGRESS_WATCH_INTERVAL)
+            await self.check_watchdog()
+
+    async def start(self):
+        self.job_task = asyncio.current_task()
+        self.tasks = [
+            asyncio.create_task(self._monitor_loop()),
+            asyncio.create_task(self._watchdog_loop()),
+        ]
+        await self.refresh(force=True)
+
+    async def fail(self, message: str, allow_retry: bool = True):
+        self.error = str(message)
+        self.retry_available = allow_retry
+        self.finished = True
+        self.unwatch()
+        await self.refresh(force=True)
+
+    async def succeed(self, detail: str):
+        for key, _ in JOB_STAGES:
+            self.completed.add(key)
+            self.details.setdefault(key, "Done")
+        self.finished = True
+        self.detail = detail
+        self.unwatch()
+        await self.refresh(force=True)
+
+    async def stop(self):
+        for task in self.tasks:
+            task.cancel()
+        if self.tasks:
+            await asyncio.gather(*self.tasks, return_exceptions=True)
+        self.tasks = []
 
 
 def calculate_encoding_bitrates(target_bytes: int, duration: float) -> tuple[int, int]:
@@ -2362,165 +2765,188 @@ async def handle_voice_clone_job(chat_id: int, reply_msg_id: int, sample: dict) 
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
-async def handle_video_job(chat_id: int, reply_msg_id: int, url: str):
+async def handle_video_job(chat_id: int, reply_msg_id: int, url: str, job_id: str = None):
+    job_id = job_id or secrets.token_hex(4)
     status_id = await send_text(
         chat_id,
-        "<b>⏳ DOWNLOADING</b>\nVideo ကို စတင်ဒေါင်းလုဒ်ဆွဲနေပါပြီ...",
+        f"<b>⏳ RECAP QUEUED</b> <code>#{job_id}</code>\n"
+        "Worker အလင်းရရင် stage-by-stage MB progress ကို ဒီ card မှာ ပြပါမယ်။",
         reply_to=reply_msg_id,
     )
-    async with job_semaphore:
-        work_dir = tempfile.mkdtemp(prefix="xhs_mm_")
-        try:
-            orig_video = os.path.join(work_dir, "orig.mp4")
-            ok = await download_rednote_video(url, orig_video)
-            if not ok:
-                await edit_text(
-                    chat_id,
-                    status_id,
-                    "<b>❌ DOWNLOAD FAILED</b>\nဒီ Link ကနေ Video ဒေါင်းလို့ မရပါဘူး။\n"
-                    "Rednote App ထဲက <b>Share ➔ Copy Link (复制链接)</b> နှိပ်ပြီး ရလာတဲ့ Link အသစ်ကို ပြန်ပို့ကြည့်ပေးပါနော်။",
-                )
-                return
+    progress = JobProgress(chat_id, status_id, job_id)
 
+    async with job_semaphore:
+        work_dir = None
+        await progress.start()
+        try:
+            work_dir = tempfile.mkdtemp(prefix="xhs_mm_")
+            orig_video = os.path.join(work_dir, "orig.mp4")
+            await progress.set_stage(
+                "download",
+                "Finding the source and downloading video…",
+                current=0,
+            )
+            progress.watch_pattern(os.path.join(work_dir, "orig*"))
+
+            async def download_stage():
+                downloaded = await download_rednote_video(url, orig_video)
+                if not downloaded:
+                    raise RetryableJobError("Download failed after all available methods")
+
+            await run_with_retries(download_stage, progress, "download")
+            progress.unwatch()
             original_size = os.path.getsize(orig_video)
+            await progress.complete("download", f"{format_mb(original_size)} downloaded")
+
             dur = await asyncio.to_thread(get_media_duration, orig_video)
             if dur <= 0.5:
-                await edit_text(
-                    chat_id,
-                    status_id,
-                    "<b>❌ VIDEO NOT FOUND</b>\nဒါက Video မဟုတ်ဘဲ ပုံ (Photo post) ဖြစ်နေပါတယ်နော်။",
-                )
-                return
+                raise PermanentJobError("No playable video was found; this may be a photo post")
             if MAX_VIDEO_MINUTES > 0 and dur > MAX_VIDEO_MINUTES * 60:
-                await edit_text(
-                    chat_id,
-                    status_id,
-                    f"<b>⚠️ DURATION LIMIT</b>\nလက်ရှိ server မှာ Video ကို {MAX_VIDEO_MINUTES:g} မိနစ်အထိပဲ လက်ခံပါတယ်။",
+                raise PermanentJobError(
+                    f"Duration limit: this server accepts up to {MAX_VIDEO_MINUTES:g} minutes"
                 )
-                return
 
             target_size = max(1000, int(original_size * FINAL_SIZE_RATIO))
-            # Encoding and disk-backed audio still need temporary space. Fail with
-            # a clear message rather than corrupting output when the disk is full.
             estimated_audio_scratch = int(dur * SAMPLE_RATE * 6)
             free_bytes = shutil.disk_usage(work_dir).free
             if free_bytes < target_size + estimated_audio_scratch:
-                raise RuntimeError(
-                    "Server disk space is insufficient for this large video; "
-                    f"about {human_file_size(target_size + estimated_audio_scratch)} more is required"
+                raise PermanentJobError(
+                    "Server disk space is insufficient; about "
+                    f"{human_file_size(target_size + estimated_audio_scratch)} more is required"
                 )
-
-            await edit_text(
-                chat_id,
-                status_id,
-                f"<b>✍️ SCRIPT WRITING</b>\n{human_file_size(original_size)} Video ရဲ့ ဇာတ်လမ်းကို နားထောင်ပြီး "
-                "<b>First-person</b> မြန်မာ Recap Script ရေးနေပါတယ်...",
-            )
 
             audio_mp3 = os.path.join(work_dir, "speech.mp3")
             audio_8k_pcm = os.path.join(work_dir, "speech8k.pcm")
-            # Read a large source only once while producing both analysis tracks.
-            audio_proc = await asyncio.to_thread(
-                run_cmd,
-                [
-                    "ffmpeg",
-                    "-y",
-                    "-i",
-                    orig_video,
-                    "-map",
-                    "0:a:0",
-                    "-vn",
-                    "-ac",
-                    "1",
-                    "-ar",
-                    "16000",
-                    "-b:a",
-                    "32k",
-                    audio_mp3,
-                    "-map",
-                    "0:a:0",
-                    "-vn",
-                    "-f",
-                    "s16le",
-                    "-acodec",
-                    "pcm_s16le",
-                    "-ac",
-                    "1",
-                    "-ar",
-                    "8000",
-                    audio_8k_pcm,
-                ],
-                FFMPEG_TIMEOUT,
+            await progress.set_stage(
+                "script",
+                "Extracting speech for first-person script analysis…",
+                current=0,
             )
-            if audio_proc.returncode != 0 or not os.path.exists(audio_mp3):
-                await edit_text(
-                    chat_id,
-                    status_id,
-                    "<b>⚠️ NO AUDIO</b>\nဒီ Video ထဲမှာ အသုံးပြုလို့ရတဲ့ စကားပြောသံ မတွေ့ပါဘူး။",
-                )
-                return
+            progress.watch_file(audio_mp3)
 
-            # memmap avoids loading an entire multi-hour PCM file into RAM.
+            async def extract_analysis_audio():
+                audio_proc = await asyncio.to_thread(
+                    run_cmd,
+                    [
+                        "ffmpeg",
+                        "-y",
+                        "-i",
+                        orig_video,
+                        "-map",
+                        "0:a:0",
+                        "-vn",
+                        "-ac",
+                        "1",
+                        "-ar",
+                        "16000",
+                        "-b:a",
+                        "32k",
+                        audio_mp3,
+                        "-map",
+                        "0:a:0",
+                        "-vn",
+                        "-f",
+                        "s16le",
+                        "-acodec",
+                        "pcm_s16le",
+                        "-ac",
+                        "1",
+                        "-ar",
+                        "8000",
+                        audio_8k_pcm,
+                    ],
+                    FFMPEG_TIMEOUT,
+                )
+                if audio_proc.returncode != 0 or not os.path.exists(audio_mp3):
+                    raise PermanentJobError("No usable speech audio was found in this video")
+
+            await run_with_retries(extract_analysis_audio, progress, "script")
+            progress.unwatch()
+            await progress.set_stage(
+                "script",
+                "Gemini is writing the complete first-person Myanmar recap…",
+            )
             wav_8k = (
                 np.memmap(audio_8k_pcm, dtype=np.int16, mode="r")
                 if os.path.exists(audio_8k_pcm) and os.path.getsize(audio_8k_pcm) > 0
                 else np.zeros(8000, dtype=np.int16)
             )
-            segments = await create_recap_script_gemini(audio_mp3, dur, wav_8k)
-            del wav_8k
+            segments = await run_with_retries(
+                lambda: create_recap_script_gemini(audio_mp3, dur, wav_8k),
+                progress,
+                "script",
+            )
+            wav_8k = None
             for analysis_path in (audio_mp3, audio_8k_pcm):
                 try:
                     os.remove(analysis_path)
                 except OSError:
                     pass
-
             if not segments:
-                await edit_text(
-                    chat_id,
-                    status_id,
-                    "<b>⚠️ NO SPEECH</b>\nဒီ Video ထဲမှာ Recap လုပ်လို့ရတဲ့ စကားပြောသံ မတွေ့ပါဘူး။",
-                )
-                return
+                raise PermanentJobError("No speech was found for a recap")
+            await progress.complete("script", f"{len(segments)} first-person segments")
 
-            clone_voice_id = await get_narration_clone_voice_id(chat_id)
-            voice_label = "Selected voice clone" if clone_voice_id else "Charon deep voice"
-            fallback_label = (
-                "Clone မရရင် Charon / Edge ကို အလိုအလျောက် အသုံးပြုပါမယ်"
-                if clone_voice_id
-                else "Gemini မရရင် ElevenLabs / Edge ကို အလိုအလျောက် အသုံးပြုပါမယ်"
+            await progress.set_stage(
+                "voice",
+                f"0/{len(segments)} segments · selecting narrator…",
             )
-            await edit_text(
-                chat_id,
-                status_id,
-                f"<b>🎙️ VOICEOVER</b>\n{voice_label} နဲ့ Recap အသံ {len(segments)} ကြောင်း သွင်းနေပါတယ်...\n"
-                f"<i>{fallback_label}</i>",
+
+            voice_stats = {"successful": 0}
+
+            async def voice_progress(processed, total, successful):
+                voice_stats["successful"] = successful
+                await progress.update(
+                    detail=f"{processed}/{total} processed · {successful} synthesized",
+                    force=processed == 1 or processed == total or processed % 3 == 0,
+                )
+
+            clone_voice_id = await run_with_retries(
+                lambda: get_narration_clone_voice_id(chat_id),
+                progress,
+                "voice",
             )
             dub_mp3 = os.path.join(work_dir, "burmese_dub.mp3")
-            tts_provider = await synthesize_dubbed_track(
-                segments,
-                dur,
-                work_dir,
-                dub_mp3,
-                clone_voice_id,
+
+            async def synthesize_stage():
+                return await synthesize_dubbed_track(
+                    segments,
+                    dur,
+                    work_dir,
+                    dub_mp3,
+                    clone_voice_id,
+                    progress_callback=voice_progress,
+                )
+
+            tts_provider = await run_with_retries(synthesize_stage, progress, "voice")
+            dub_size = os.path.getsize(dub_mp3) if os.path.exists(dub_mp3) else 0
+            await progress.complete(
+                "voice",
+                f"{voice_stats['successful']}/{len(segments)} synthesized · "
+                f"{format_mb(dub_size)} · {tts_provider}",
             )
 
-            await edit_text(
-                chat_id,
-                status_id,
-                f"<b>🎞️ RENDERING</b>\nFinal Video ကို မူရင်း size ရဲ့ <b>{int(FINAL_SIZE_RATIO * 100)}%</b> "
-                f"(~{human_file_size(target_size)}) ဖြစ်အောင် Edit လုပ်နေပါပြီ...",
+            await progress.set_stage(
+                "render",
+                f"Encoding toward {format_mb(target_size)} ({int(FINAL_SIZE_RATIO * 100)}%)…",
+                current=0,
+                total=target_size,
             )
             final_video = os.path.join(work_dir, "final_mm.mp4")
-            final_size = await encode_video_to_target_size(
-                orig_video,
-                final_video,
-                target_size,
-                dur,
-                dub_mp3,
-            )
+            progress.watch_pattern(os.path.join(work_dir, "final_mm*.mp4"))
 
-            # The source and intermediate audio are no longer needed; releasing
-            # them leaves space for the temporary Telegram split copies.
+            async def render_stage():
+                return await encode_video_to_target_size(
+                    orig_video,
+                    final_video,
+                    target_size,
+                    dur,
+                    dub_mp3,
+                )
+
+            final_size = await run_with_retries(render_stage, progress, "render")
+            progress.unwatch()
+            await progress.complete("render", f"{format_mb(final_size)} final video")
+
             for intermediate in (orig_video, dub_mp3):
                 try:
                     os.remove(intermediate)
@@ -2529,73 +2955,100 @@ async def handle_video_job(chat_id: int, reply_msg_id: int, url: str):
 
             free_for_parts = shutil.disk_usage(work_dir).free
             if final_size > TELEGRAM_PART_LIMIT_BYTES and free_for_parts < final_size:
-                raise RuntimeError(
+                raise PermanentJobError(
                     f"Server needs about {human_file_size(final_size)} free space to split this video"
                 )
 
-            parts = await split_video_for_telegram(final_video, work_dir)
+            await progress.set_stage(
+                "upload",
+                "Preparing playable Telegram-safe MP4 parts…",
+                current=0,
+                total=final_size,
+            )
+            parts = await run_with_retries(
+                lambda: split_video_for_telegram(final_video, work_dir),
+                progress,
+                "upload",
+            )
             total_parts = len(parts)
-            await edit_text(
-                chat_id,
-                status_id,
-                f"<b>📤 UPLOADING</b>\nFinal Video ({human_file_size(final_size)}) ကို "
-                f"<b>{total_parts} ပိုင်း</b>နဲ့ Telegram ဆီ ပို့နေပါပြီ...",
+            total_upload_bytes = sum(os.path.getsize(part) for part in parts)
+            uploaded_bytes = 0
+            await progress.update(
+                detail=f"0/{total_parts} parts uploaded",
+                current=0,
+                total=total_upload_bytes,
+                force=True,
             )
 
             for part_number, part_path in enumerate(parts, 1):
-                caption = f"<b>✅ မြန်မာ Recap</b> • မူရင်း size ရဲ့ {int(FINAL_SIZE_RATIO * 100)}%"
+                part_size = os.path.getsize(part_path)
+                await progress.update(
+                    detail=f"Part {part_number}/{total_parts} · {format_mb(part_size)} uploading",
+                    current=uploaded_bytes,
+                    total=total_upload_bytes,
+                    force=True,
+                )
+                caption = (
+                    f"<b>✅ မြန်မာ Recap</b> • မူရင်း size ရဲ့ {int(FINAL_SIZE_RATIO * 100)}%"
+                )
                 if total_parts > 1:
                     caption += f" • Part {part_number}/{total_parts}"
-                with open(part_path, "rb") as video_file:
-                    send_res = await tg_api(
-                        "sendVideo",
-                        data={
-                            "chat_id": str(chat_id),
-                            "caption": caption,
-                            "parse_mode": "HTML",
-                            "reply_to_message_id": str(reply_msg_id),
-                            "supports_streaming": "true",
-                        },
-                        files={
-                            "video": (
-                                f"rednote_myanmar_part_{part_number:04d}.mp4",
-                                video_file,
-                                "video/mp4",
-                            )
-                        },
-                        timeout=TELEGRAM_UPLOAD_TIMEOUT,
-                    )
 
-                if not send_res.get("ok"):
-                    description = send_res.get("description") or send_res.get("error") or str(send_res)
-                    await edit_text(
-                        chat_id,
-                        status_id,
-                        f"<b>⚠️ UPLOAD FAILED</b>\nPart {part_number}/{total_parts} ပို့ရာမှာ အခက်အခဲရှိပါတယ်: "
-                        f"{html.escape(str(description)[:180])}",
-                    )
-                    return
+                async def upload_part(part_path=part_path, part_number=part_number, caption=caption):
+                    with open(part_path, "rb") as video_file:
+                        send_res = await tg_api(
+                            "sendVideo",
+                            data={
+                                "chat_id": str(chat_id),
+                                "caption": caption,
+                                "parse_mode": "HTML",
+                                "reply_to_message_id": str(reply_msg_id),
+                                "supports_streaming": "true",
+                            },
+                            files={
+                                "video": (
+                                    f"rednote_myanmar_part_{part_number:04d}.mp4",
+                                    video_file,
+                                    "video/mp4",
+                                )
+                            },
+                            timeout=TELEGRAM_UPLOAD_TIMEOUT,
+                        )
+                    if not send_res.get("ok"):
+                        description = (
+                            send_res.get("description")
+                            or send_res.get("error")
+                            or "Telegram upload failed"
+                        )
+                        if is_transient_error(RuntimeError(str(description))):
+                            raise RetryableJobError(str(description))
+                        raise RuntimeError(str(description))
 
-                # Delete each uploaded part immediately to keep large-job disk use low.
+                await run_with_retries(upload_part, progress, "upload")
+                uploaded_bytes += part_size
+                await progress.update(
+                    detail=f"Part {part_number}/{total_parts} uploaded",
+                    current=uploaded_bytes,
+                    total=total_upload_bytes,
+                    force=True,
+                )
                 try:
                     os.remove(part_path)
                 except OSError:
                     pass
-                if part_number < total_parts and (part_number == 1 or part_number % 5 == 0):
-                    await edit_text(
-                        chat_id,
-                        status_id,
-                        f"<b>📤 UPLOADING · {part_number}/{total_parts}</b>\n"
-                        f"Part {part_number} ပို့ပြီးပါပြီ။ ကျန်တာတွေ ဆက်ပို့နေပါတယ်...",
-                    )
                 await asyncio.sleep(0.35)
 
-            try:
-                await tg_api("deleteMessage", {"chat_id": chat_id, "message_id": status_id})
-            except Exception:
-                pass
+            await progress.complete(
+                "upload",
+                f"{total_parts} parts · {format_mb(uploaded_bytes)} delivered",
+            )
+            retry_jobs.pop(job_id, None)
+            await progress.succeed(
+                f"{format_mb(final_size)} · {total_parts} Telegram part(s) · Done"
+            )
             logger.info(
-                "Completed job for chat %s: %s final, %s parts, TTS=%s",
+                "Completed job %s for chat %s: %s final, %s parts, TTS=%s",
+                job_id,
                 chat_id,
                 human_file_size(final_size),
                 total_parts,
@@ -2603,14 +3056,16 @@ async def handle_video_job(chat_id: int, reply_msg_id: int, url: str):
             )
 
         except Exception as exc:
-            logger.exception("Job processing error")
-            await edit_text(
-                chat_id,
-                status_id,
-                f"<b>❌ SYSTEM ERROR</b>\nအမှားအယွင်းတစ်ခု ဖြစ်သွားပါတယ်: {html.escape(str(exc)[:200])}",
-            )
+            logger.exception("Job %s processing error", job_id)
+            allow_retry = not isinstance(exc, PermanentJobError)
+            if allow_retry:
+                remember_retry_job(job_id, chat_id, reply_msg_id, url)
+            message = str(exc) or exc.__class__.__name__
+            await progress.fail(message, allow_retry=allow_retry)
         finally:
-            shutil.rmtree(work_dir, ignore_errors=True)
+            await progress.stop()
+            if work_dir:
+                shutil.rmtree(work_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":
