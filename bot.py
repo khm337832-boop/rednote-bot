@@ -108,7 +108,9 @@ GEMINI_SCRIPT_HELPER_DELAY_SECONDS = env_int("GEMINI_SCRIPT_HELPER_DELAY_SECONDS
 GEMINI_SCRIPT_MODEL_TIMEOUT = env_int("GEMINI_SCRIPT_MODEL_TIMEOUT", 180, 30)
 DEEPSEEK_POLISH_TIMEOUT = env_int("DEEPSEEK_POLISH_TIMEOUT", 60, 5)
 PIPELINE_WORKERS = min(4, env_int("PIPELINE_WORKERS", 4, 1))
+RENDER_WORKERS = min(4, env_int("RENDER_WORKERS", PIPELINE_WORKERS, 1))
 RENDER_THREADS_PER_WORKER = env_int("RENDER_THREADS_PER_WORKER", 1, 1)
+RENDER_NO_OUTPUT_TIMEOUT = env_int("RENDER_NO_OUTPUT_TIMEOUT", 120, 15)
 SOURCE_CREDIT_ENABLED = os.environ.get("SOURCE_CREDIT_ENABLED", "true").strip().lower() not in {
     "0",
     "false",
@@ -359,7 +361,8 @@ def status_message(chat_id: int = None) -> str:
         f"{personal_voice_line}"
         f"┣ <b>Voice clone:</b> {clone_status}\n"
         f"┣ <b>Script timing:</b> Video ရဲ့ {int(SCRIPT_DURATION_RATIO * 100)}% ခန့်\n"
-        f"┣ <b>Pipeline:</b> {PIPELINE_WORKERS} worker(s) · Script/Voice/Render\n"
+        f"┣ <b>Pipeline:</b> {PIPELINE_WORKERS} worker(s) · Script/Voice\n"
+        f"┣ <b>Render workers:</b> {RENDER_WORKERS} · {RENDER_NO_OUTPUT_TIMEOUT}s no-output guard\n"
         f"┣ <b>DeepSeek polish:</b> {deepseek_status}\n"
         f"┣ <b>ElevenLabs fallback:</b> {elevenlabs_status}\n"
         "┣ <b>DYY Agent:</b> Always On · Live\n"
@@ -2753,6 +2756,10 @@ class RetryableJobError(RuntimeError):
     """A transient stage failure that can be retried safely."""
 
 
+class RenderNoOutputError(RetryableJobError):
+    """FFmpeg stayed busy without producing new frames or output time."""
+
+
 def format_mb(size_bytes) -> str:
     if size_bytes is None:
         return "—"
@@ -3341,8 +3348,24 @@ async def stop_subprocess(process) -> None:
         await process.wait()
 
 
-async def run_ffmpeg_with_progress(cmd: list[str], timeout: int, progress_callback=None):
-    """Run FFmpeg with machine-readable stats and recover from a genuine stall."""
+def ffmpeg_stats_have_output(stats: dict) -> bool:
+    """Require real frame/time output; container headers alone are not progress."""
+    for key in ("frame", "out_time_ms", "out_time_us"):
+        try:
+            if float(stats.get(key, 0)) > 0:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
+async def run_ffmpeg_with_progress(
+    cmd: list[str],
+    timeout: int,
+    progress_callback=None,
+    no_output_timeout: float = None,
+):
+    """Run FFmpeg with stats, CPU stall recovery, and an optional output deadline."""
     process = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
@@ -3350,6 +3373,7 @@ async def run_ffmpeg_with_progress(cmd: list[str], timeout: int, progress_callba
     )
     started = time.monotonic()
     last_activity = started
+    last_output_activity = started
     last_signature = None
     last_cpu = process_cpu_seconds(process.pid)
     stats = {}
@@ -3375,6 +3399,13 @@ async def run_ffmpeg_with_progress(cmd: list[str], timeout: int, progress_callba
             now = time.monotonic()
             if now - started > timeout:
                 raise RetryableJobError(f"FFmpeg render exceeded the {timeout}s timeout")
+            if (
+                no_output_timeout is not None
+                and now - last_output_activity >= no_output_timeout
+            ):
+                raise RenderNoOutputError(
+                    f"FFmpeg produced no new frame/output for {int(no_output_timeout)}s"
+                )
             if not done:
                 if now - last_activity < PROGRESS_STALL_SECONDS:
                     continue
@@ -3413,6 +3444,8 @@ async def run_ffmpeg_with_progress(cmd: list[str], timeout: int, progress_callba
             if signature != last_signature:
                 last_signature = signature
                 last_activity = time.monotonic()
+                if ffmpeg_stats_have_output(stats):
+                    last_output_activity = time.monotonic()
             if progress_callback:
                 await progress_callback(dict(stats))
             stats = {}
@@ -3528,6 +3561,7 @@ async def encode_video_to_target_size_sequential(
             cmd,
             FFMPEG_TIMEOUT,
             progress_callback=report_attempt_progress if progress_callback else None,
+            no_output_timeout=RENDER_NO_OUTPUT_TIMEOUT,
         )
         if proc.returncode != 0:
             logger.warning("Target encode failed: %s", proc.stderr.decode(errors="ignore")[-300:])
@@ -3752,6 +3786,7 @@ async def encode_video_to_target_size_parallel(
                 cmd,
                 FFMPEG_TIMEOUT,
                 progress_callback=report_part_progress,
+                no_output_timeout=RENDER_NO_OUTPUT_TIMEOUT,
             )
             if proc.returncode != 0:
                 raise RetryableJobError(
@@ -3782,16 +3817,39 @@ async def encode_video_to_target_size_parallel(
             return part_path
 
         try:
-            results = await asyncio.gather(
-                *(
-                    render_part(timeline_range, part_path)
-                    for timeline_range, part_path in zip(ranges, part_paths)
-                ),
-                return_exceptions=True,
-            )
-            failures = [result for result in results if isinstance(result, Exception)]
-            if failures:
-                raise RuntimeError(f"Parallel render parts failed: {failures[0]}") from failures[0]
+            part_tasks = [
+                asyncio.create_task(render_part(timeline_range, part_path))
+                for timeline_range, part_path in zip(ranges, part_paths)
+            ]
+            try:
+                done, _ = await asyncio.wait(
+                    part_tasks,
+                    return_when=asyncio.FIRST_EXCEPTION,
+                )
+                failures = []
+                for task in done:
+                    try:
+                        task.result()
+                    except Exception as exc:
+                        failures.append(exc)
+                if failures:
+                    failure = next(
+                        (
+                            exc
+                            for exc in failures
+                            if isinstance(exc, RenderNoOutputError)
+                        ),
+                        failures[0],
+                    )
+                    raise failure
+            except BaseException:
+                # A single failed/stalled part must not leave sibling FFmpeg
+                # processes running while the sequential fallback starts.
+                for task in part_tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*part_tasks, return_exceptions=True)
+                raise
 
             with open(concat_path, "w", encoding="utf-8") as concat_file:
                 for part_path in part_paths:
@@ -3832,6 +3890,7 @@ async def encode_video_to_target_size_parallel(
                 join_cmd,
                 FFMPEG_TIMEOUT,
                 progress_callback=report_join_progress,
+                no_output_timeout=RENDER_NO_OUTPUT_TIMEOUT,
             )
             if join_proc.returncode != 0:
                 raise RetryableJobError(
@@ -3881,10 +3940,16 @@ async def encode_video_to_target_size_parallel(
             logger.warning("Parallel render attempt %s failed: %s", attempt + 1, str(exc)[:220])
             if best_path != joined_path:
                 remove_files([joined_path])
+            if isinstance(exc, RenderNoOutputError):
+                # Repeating the same no-output parallel assignment wastes time;
+                # let the public wrapper take the sequential path immediately.
+                break
         finally:
             remove_files(part_paths + [concat_path])
 
     if not best_path:
+        if isinstance(last_error, RenderNoOutputError):
+            raise last_error
         raise RuntimeError("Parallel FFmpeg workers could not create a valid final video") from last_error
 
     if os.path.abspath(best_path) != os.path.abspath(output_path):
@@ -3907,7 +3972,7 @@ async def encode_video_to_target_size(
     progress_callback=None,
 ) -> int:
     """Use bounded parallel parts, retaining the original encoder as fallback."""
-    if PIPELINE_WORKERS <= 1 or duration < 1.0:
+    if RENDER_WORKERS <= 1 or duration < 1.0:
         return await encode_video_to_target_size_sequential(
             input_path,
             output_path,
@@ -3924,7 +3989,7 @@ async def encode_video_to_target_size(
             duration,
             audio_path,
             progress_callback,
-            worker_count=PIPELINE_WORKERS,
+            worker_count=RENDER_WORKERS,
         )
     except Exception as exc:
         logger.warning("Falling back to sequential target encoding: %s", str(exc)[:180])
@@ -3935,6 +4000,7 @@ async def encode_video_to_target_size(
                     "total_size": "0",
                     "speed": "N/A",
                     "sequential_fallback": "1",
+                    "fallback_reason": str(exc)[:120],
                 },
                 1,
             )
@@ -4317,7 +4383,7 @@ async def handle_video_job(chat_id: int, reply_msg_id: int, url: str, job_id: st
             estimated_audio_scratch = int(dur * SAMPLE_RATE * 6)
             # A corrective parallel attempt can coexist with the previous best
             # joined file and the current part set. Reserve all three up front.
-            render_scratch = target_size * (3 if PIPELINE_WORKERS > 1 else 2)
+            render_scratch = target_size * (3 if RENDER_WORKERS > 1 else 2)
             required_scratch = estimated_audio_scratch + render_scratch
             free_bytes = shutil.disk_usage(work_dir).free
             if free_bytes < required_scratch:
@@ -4453,7 +4519,7 @@ async def handle_video_job(chat_id: int, reply_msg_id: int, url: str, job_id: st
 
             await progress.set_stage(
                 "render",
-                f"{PIPELINE_WORKERS} worker(s) · encoding toward {format_mb(target_size)} "
+                f"{RENDER_WORKERS} render worker(s) · encoding toward {format_mb(target_size)} "
                 f"({int(FINAL_SIZE_RATIO * 100)}%)…",
                 current=0,
                 total=target_size,
@@ -4474,7 +4540,12 @@ async def handle_video_job(chat_id: int, reply_msg_id: int, url: str, job_id: st
                 speed = str(stats.get("speed", "")).strip()
                 part_count = str(stats.get("pipeline_parts", "")).strip()
                 if stats.get("sequential_fallback"):
-                    pass_label = "Sequential render fallback"
+                    fallback_reason = str(stats.get("fallback_reason", ""))
+                    pass_label = (
+                        "No output · sequential render fallback"
+                        if "no new frame/output" in fallback_reason
+                        else "Sequential render fallback"
+                    )
                 elif stats.get("validated"):
                     pass_label = f"Validated {part_count or 'all'} ordered parts"
                 elif stats.get("joining"):
