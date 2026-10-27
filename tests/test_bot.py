@@ -443,7 +443,10 @@ class EncodingAndSplittingTests(unittest.TestCase):
     def test_target_encode_runs_corrective_pass(self):
         calls = []
 
-        async def fake_run_ffmpeg(cmd, timeout, progress_callback=None):
+        async def fake_run_ffmpeg(
+            cmd, timeout, progress_callback=None, no_output_timeout=None
+        ):
+            self.assertEqual(no_output_timeout, bot.RENDER_NO_OUTPUT_TIMEOUT)
             calls.append(cmd)
             output = cmd[-1]
             size = 800_000 if "attempt0" in output else 950_000
@@ -458,7 +461,7 @@ class EncodingAndSplittingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, patch.object(
             bot, "run_ffmpeg_with_progress", side_effect=fake_run_ffmpeg
         ), patch.object(bot, "get_media_duration", return_value=100.0), patch.object(
-            bot, "PIPELINE_WORKERS", 1
+            bot, "RENDER_WORKERS", 1
         ):
             source = os.path.join(directory, "source.mp4")
             audio = os.path.join(directory, "audio.mp3")
@@ -534,6 +537,56 @@ class EncodingAndSplittingTests(unittest.TestCase):
 
         result = asyncio.run(run_flow())
         self.assertEqual(result.returncode, 0)
+
+    def test_busy_process_without_output_is_stopped_even_when_cpu_advances(self):
+        started = bot.time.monotonic()
+
+        async def run_flow():
+            with patch.object(bot, "PROGRESS_STALL_SECONDS", 0.05), patch.object(
+                bot, "PROGRESS_WATCH_INTERVAL", 0.05
+            ), patch.object(
+                bot, "process_cpu_seconds", side_effect=lambda _pid: bot.time.monotonic()
+            ):
+                await bot.run_ffmpeg_with_progress(
+                    [sys.executable, "-c", "import time; time.sleep(30)"],
+                    10,
+                    no_output_timeout=0.2,
+                )
+
+        with self.assertRaises(bot.RenderNoOutputError) as raised:
+            asyncio.run(run_flow())
+
+        self.assertLess(bot.time.monotonic() - started, 5.0)
+        self.assertIn("no new frame/output", str(raised.exception))
+
+    def test_output_deadline_resets_for_real_frame_progress(self):
+        reports = []
+        script = (
+            "import sys,time\n"
+            "for i in range(1, 6):\n"
+            "    sys.stdout.write(f'frame={i}\\nout_time_ms={i * 1000}\\n"
+            "total_size={i * 100}\\nprogress=continue\\n')\n"
+            "    sys.stdout.flush()\n"
+            "    time.sleep(0.06)\n"
+        )
+
+        async def report(stats):
+            reports.append(stats)
+
+        with patch.object(bot, "PROGRESS_WATCH_INTERVAL", 0.05), patch.object(
+            bot, "PROGRESS_STALL_SECONDS", 10
+        ):
+            result = asyncio.run(
+                bot.run_ffmpeg_with_progress(
+                    [sys.executable, "-u", "-c", script],
+                    10,
+                    progress_callback=report,
+                    no_output_timeout=0.2,
+                )
+            )
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(len(reports), 5)
+        self.assertEqual(reports[-1]["frame"], "5")
 
     def test_large_file_is_split_in_order_under_limit(self):
         def fake_run_cmd(cmd, timeout):
@@ -930,6 +983,7 @@ class BotInterfaceTests(unittest.TestCase):
         self.assertNotIn("dyy", callbacks)
         self.assertIn("Always On · Live", bot.status_message(123))
         self.assertIn(f"{bot.PIPELINE_WORKERS} worker(s)", bot.status_message(123))
+        self.assertIn("no-output guard", bot.status_message(123))
         self.assertFalse(hasattr(bot, "dyy_preferences"))
         self.assertFalse(hasattr(bot, "DYY_AGENT_ENABLED"))
 
@@ -1464,7 +1518,10 @@ class ParallelRenderingTests(unittest.TestCase):
         progress = []
         concat_order = []
 
-        async def fake_run_ffmpeg(cmd, timeout, progress_callback=None):
+        async def fake_run_ffmpeg(
+            cmd, timeout, progress_callback=None, no_output_timeout=None
+        ):
+            self.assertEqual(no_output_timeout, bot.RENDER_NO_OUTPUT_TIMEOUT)
             active[0] += 1
             active[1] = max(active[1], active[0])
             calls.append(cmd)
@@ -1547,6 +1604,77 @@ class ParallelRenderingTests(unittest.TestCase):
         self.assertTrue(any(stats.get("validated") for stats, _ in progress))
         self.assertEqual(parts_remain, [])
 
+    def test_no_output_part_cancels_siblings_and_uses_sequential_fallback(self):
+        cancelled_parts = []
+        sequential_calls = []
+        progress = []
+        started = bot.time.monotonic()
+
+        async def fake_run_ffmpeg(
+            cmd, timeout, progress_callback=None, no_output_timeout=None
+        ):
+            if ".part0." in cmd[-1]:
+                await asyncio.sleep(0)
+                raise bot.RenderNoOutputError("no new frame/output for 120s")
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                cancelled_parts.append(cmd[-1])
+                raise
+
+        async def fake_sequential(*args):
+            sequential_calls.append(args)
+            return 123_000
+
+        async def report(stats, encode_pass):
+            progress.append(stats)
+
+        with patch.object(bot, "RENDER_WORKERS", 4), patch.object(
+            bot, "run_ffmpeg_with_progress", side_effect=fake_run_ffmpeg
+        ), patch.object(
+            bot, "encode_video_to_target_size_sequential", side_effect=fake_sequential
+        ):
+            result = asyncio.run(
+                bot.encode_video_to_target_size(
+                    "source.mp4",
+                    "final.mp4",
+                    1_000_000,
+                    100.0,
+                    "audio.mp3",
+                    progress_callback=report,
+                )
+            )
+        self.assertEqual(result, 123_000)
+        self.assertEqual(len(sequential_calls), 1)
+        self.assertEqual(len(cancelled_parts), 3)
+        self.assertIn("no new frame/output", progress[0]["fallback_reason"])
+        self.assertLess(bot.time.monotonic() - started, 5.0)
+
+    def test_render_worker_override_is_independent_from_pipeline_workers(self):
+        sequential_calls = []
+
+        async def fake_sequential(*args):
+            sequential_calls.append(args)
+            return 123_000
+
+        async def unexpected_parallel(*args, **kwargs):
+            raise AssertionError("parallel renderer must stay off")
+
+        with patch.object(bot, "PIPELINE_WORKERS", 4), patch.object(
+            bot, "RENDER_WORKERS", 1
+        ), patch.object(
+            bot, "encode_video_to_target_size_parallel", side_effect=unexpected_parallel
+        ), patch.object(
+            bot, "encode_video_to_target_size_sequential", side_effect=fake_sequential
+        ):
+            result = asyncio.run(
+                bot.encode_video_to_target_size(
+                    "source.mp4", "final.mp4", 1_000_000, 100.0, "audio.mp3"
+                )
+            )
+        self.assertEqual(result, 123_000)
+        self.assertEqual(len(sequential_calls), 1)
+
     def test_render_wrapper_reports_and_uses_sequential_fallback(self):
         sequential_calls = []
         parallel_calls = []
@@ -1563,7 +1691,7 @@ class ParallelRenderingTests(unittest.TestCase):
         async def report(stats, encode_pass):
             progress.append(stats)
 
-        with patch.object(bot, "PIPELINE_WORKERS", 4), patch.object(
+        with patch.object(bot, "RENDER_WORKERS", 4), patch.object(
             bot, "encode_video_to_target_size_parallel", side_effect=failed_parallel
         ), patch.object(bot, "encode_video_to_target_size_sequential", side_effect=fake_sequential):
             result = asyncio.run(
